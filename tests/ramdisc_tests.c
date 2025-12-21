@@ -26,6 +26,12 @@ struct name_list {
     int count;
 };
 
+struct test_case {
+    const char* name;   /* identifier used by --case */
+    const char* pretty; /* human-friendly label */
+    void (*fn)(void);
+};
+
 static int collect_names(const char* name, const rd_stat_info* st, void* user) {
     (void)st;
     struct name_list* nl = (struct name_list*)user;
@@ -211,15 +217,74 @@ static void test_backing_persistence(void) {
     unlink(path);
 }
 
-int main(void) {
-    run_test("root stat", test_root_stat);
-    run_test("create/write/read", test_create_write_read);
-    run_test("mkdir/readdir", test_mkdir_readdir);
-    run_test("large write indirect", test_large_write_indirect);
-    run_test("rmdir non-empty", test_rmdir_nonempty_fails);
-    run_test("enospc handling", test_enospc);
-    run_test("block API", test_block_api);
-    run_test("backing persistence", test_backing_persistence);
+static const struct test_case TEST_CASES[] = {
+    {"root_stat", "root stat", test_root_stat},
+    {"create_write_read", "create/write/read", test_create_write_read},
+    {"mkdir_readdir", "mkdir/readdir", test_mkdir_readdir},
+    {"large_write_indirect", "large write indirect", test_large_write_indirect},
+    {"rmdir_nonempty", "rmdir non-empty", test_rmdir_nonempty_fails},
+    {"enospc_handling", "enospc handling", test_enospc},
+    {"block_api", "block API", test_block_api},
+    {"backing_persistence", "backing persistence", test_backing_persistence},
+};
+
+static const size_t TEST_CASE_COUNT = sizeof(TEST_CASES) / sizeof(TEST_CASES[0]);
+
+static const struct test_case* find_case(const char* name) {
+    for (size_t i = 0; i < TEST_CASE_COUNT; ++i) {
+        if (strcmp(TEST_CASES[i].name, name) == 0) {
+            return &TEST_CASES[i];
+        }
+    }
+    return NULL;
+}
+
+static void list_cases(void) {
+    for (size_t i = 0; i < TEST_CASE_COUNT; ++i) {
+        printf("  %s\t%s\n", TEST_CASES[i].name, TEST_CASES[i].pretty);
+    }
+}
+
+static void usage(const char* prog) {
+    printf("Usage: %s [--case NAME] [--list] [--help]\n", prog);
+}
+
+int main(int argc, char** argv) {
+    const struct test_case* selected = NULL;
+
+    if (argc > 1) {
+        if (strcmp(argv[1], "--list") == 0) {
+            list_cases();
+            return 0;
+        } else if (strcmp(argv[1], "--case") == 0) {
+            if (argc < 3) {
+                usage(argv[0]);
+                return 1;
+            }
+            selected = find_case(argv[2]);
+            if (!selected) {
+                fprintf(stderr, "Unknown test case: %s\n", argv[2]);
+                list_cases();
+                return 1;
+            }
+        } else if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+            usage(argv[0]);
+            list_cases();
+            return 0;
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (selected) {
+        run_test(selected->pretty, selected->fn);
+    } else {
+        for (size_t i = 0; i < TEST_CASE_COUNT; ++i) {
+            run_test(TEST_CASES[i].pretty, TEST_CASES[i].fn);
+        }
+    }
+
     printf("ramdisc tests passed\n");
     return 0;
 }

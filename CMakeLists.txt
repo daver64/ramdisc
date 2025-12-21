@@ -116,5 +116,18 @@ if(RD_BUILD_TESTS)
     else()
         target_compile_options(ramdisc_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
-    add_test(NAME ramdisc_tests COMMAND ramdisc_tests)
+    set(RAMDISC_TEST_CASES
+        root_stat
+        create_write_read
+        mkdir_readdir
+        large_write_indirect
+        rmdir_nonempty
+        enospc_handling
+        block_api
+        backing_persistence
+    )
+    foreach(tc IN LISTS RAMDISC_TEST_CASES)
+        add_test(NAME ramdisc.${tc} COMMAND ramdisc_tests --case ${tc})
+    endforeach()
+    add_test(NAME ramdisc.all COMMAND ramdisc_tests)
 endif()
