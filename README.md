@@ -104,7 +104,8 @@ Functions return `RD_OK` (0) or negative `rd_err` codes:
 ## API contracts and behavior
 
 ### File descriptors
-- File descriptors are integers in range [0, 64)
+- File descriptors are integers starting from 0
+- Initial capacity: 64 handles, grows dynamically up to 1024 as needed
 - Each `rd_open` allocates a new handle; same file can be opened multiple times
 - Each handle maintains independent position offset
 - Closing an fd makes it available for reuse
