@@ -104,9 +104,11 @@ RD_API int rd_close(rd_device_t dev, rd_fd fd);
 RD_API int rd_fstat(rd_device_t dev, rd_fd fd, rd_stat_info* st);
 RD_API int rd_stat(rd_device_t dev, const char* path, rd_stat_info* st);
 RD_API int rd_unlink(rd_device_t dev, const char* path);
+RD_API int rd_rename(rd_device_t dev, const char* old_path, const char* new_path);
 RD_API int rd_mkdir(rd_device_t dev, const char* path);
 RD_API int rd_rmdir(rd_device_t dev, const char* path);
 RD_API int rd_readdir(rd_device_t dev, const char* path, rd_dirent_cb cb, void* user);
+RD_API int rd_fsync(rd_device_t dev, rd_fd fd);
 
 #ifdef __cplusplus
 }

@@ -494,6 +494,109 @@ static void test_many_handles(void) {
     rd_destroy(dev);
 }
 
+static void test_rename(void) {
+    rd_device_t dev = rd_create(200 * 1024, 4096, NULL, 0);
+    CHECK_OK(rd_mount(dev));
+    
+    printf("  - create file /old_file\n");
+    rd_fd fd = rd_open(dev, "/old_file", RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd >= 0);
+    ssize_t w = rd_write(dev, fd, "original", 8);
+    assert(w == 8);
+    CHECK_OK(rd_close(dev, fd));
+    
+    printf("  - rename /old_file to /new_file\n");
+    CHECK_OK(rd_rename(dev, "/old_file", "/new_file"));
+    
+    printf("  - verify old path doesn't exist\n");
+    rd_stat_info st;
+    assert(rd_stat(dev, "/old_file", &st) == RD_ERR_NOENT);
+    
+    printf("  - verify new path exists with same content\n");
+    CHECK_OK(rd_stat(dev, "/new_file", &st));
+    assert(st.size_bytes == 8);
+    fd = rd_open(dev, "/new_file", RD_O_RDONLY, 0);
+    assert(fd >= 0);
+    char buf[16] = {0};
+    ssize_t r = rd_read(dev, fd, buf, sizeof(buf));
+    assert(r == 8);
+    assert(memcmp(buf, "original", 8) == 0);
+    CHECK_OK(rd_close(dev, fd));
+    
+    printf("  - create /dir and rename file into directory\n");
+    CHECK_OK(rd_mkdir(dev, "/dir"));
+    CHECK_OK(rd_rename(dev, "/new_file", "/dir/moved_file"));
+    
+    printf("  - verify file moved into directory\n");
+    assert(rd_stat(dev, "/new_file", &st) == RD_ERR_NOENT);
+    CHECK_OK(rd_stat(dev, "/dir/moved_file", &st));
+    assert(st.size_bytes == 8);
+    
+    printf("  - test rename with overwrite\n");
+    fd = rd_open(dev, "/dir/target", RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd >= 0);
+    w = rd_write(dev, fd, "will be replaced", 16);
+    assert(w == 16);
+    CHECK_OK(rd_close(dev, fd));
+    
+    CHECK_OK(rd_rename(dev, "/dir/moved_file", "/dir/target"));
+    CHECK_OK(rd_stat(dev, "/dir/target", &st));
+    assert(st.size_bytes == 8);  /* Should be size of moved_file, not target */
+    
+    printf("  - test directory rename\n");
+    CHECK_OK(rd_rename(dev, "/dir", "/renamed_dir"));
+    assert(rd_stat(dev, "/dir", &st) == RD_ERR_NOENT);
+    CHECK_OK(rd_stat(dev, "/renamed_dir", &st));
+    assert(st.type == RD_FT_DIR);
+    CHECK_OK(rd_stat(dev, "/renamed_dir/target", &st));
+    
+    rd_destroy(dev);
+}
+
+static void test_fsync(void) {
+    char tmpfile[] = "/tmp/ramdisc_fsync_XXXXXX";
+    int tmp_fd = mkstemp(tmpfile);
+    assert(tmp_fd >= 0);
+    close(tmp_fd);
+    
+    printf("  - create device with backing file %s\n", tmpfile);
+    rd_device_t dev = rd_create(200 * 1024, 4096, tmpfile, RD_BACKING_CREATE | RD_BACKING_TRUNC);
+    assert(dev != NULL);
+    CHECK_OK(rd_mount(dev));
+    
+    printf("  - create and write to file\n");
+    rd_fd fd = rd_open(dev, "/fsync_test", RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd >= 0);
+    const char* data = "this should be synced";
+    ssize_t w = rd_write(dev, fd, data, strlen(data));
+    assert(w == (ssize_t)strlen(data));
+    
+    printf("  - fsync file (should flush to backing)\n");
+    CHECK_OK(rd_fsync(dev, fd));
+    CHECK_OK(rd_close(dev, fd));
+    
+    printf("  - unmount and remount from backing\n");
+    CHECK_OK(rd_unmount(dev));
+    rd_destroy(dev);
+    
+    dev = rd_create(200 * 1024, 4096, tmpfile, 0);
+    assert(dev != NULL);
+    CHECK_OK(rd_mount(dev));
+    
+    printf("  - verify data persisted\n");
+    fd = rd_open(dev, "/fsync_test", RD_O_RDONLY, 0);
+    assert(fd >= 0);
+    char buf[64] = {0};
+    ssize_t r = rd_read(dev, fd, buf, sizeof(buf));
+    assert(r == (ssize_t)strlen(data));
+    assert(memcmp(buf, data, strlen(data)) == 0);
+    CHECK_OK(rd_close(dev, fd));
+    
+    CHECK_OK(rd_unmount(dev));
+    rd_destroy(dev);
+    unlink(tmpfile);
+}
+
 static const struct test_case TEST_CASES[] = {
     {"root_stat", "root stat", test_root_stat},
     {"create_write_read", "create/write/read", test_create_write_read},
@@ -510,6 +613,8 @@ static const struct test_case TEST_CASES[] = {
     {"enospc_recovery", "ENOSPC recovery", test_enospc_recovery},
     {"double_indirect", "double indirect blocks", test_double_indirect},
     {"many_handles", "dynamic handle growth", test_many_handles},
+    {"rename", "file and directory rename", test_rename},
+    {"fsync", "per-file fsync", test_fsync},
 };
 
 static const size_t TEST_CASE_COUNT = sizeof(TEST_CASES) / sizeof(TEST_CASES[0]);

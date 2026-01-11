@@ -154,12 +154,13 @@ Functions return `RD_OK` (0) or negative `rd_err` codes:
 ## Performance characteristics
 
 ### Time complexity
-- **Block allocation**: O(n) where n = block_count; linear search from data_start
-- **Inode allocation**: O(n) where n = inode_count; linear search
+- **Block allocation**: O(1) using free list (was O(n))
+- **Inode allocation**: O(1) using free list (was O(n))
 - **Path lookup**: O(d × m) where d = path depth, m = entries per directory (linear search)
 - **Directory add/remove**: O(m) where m = entries in directory
 - **File read/write**: O(k) where k = blocks accessed; block lookup is O(1) direct, O(1) indirect
 - **rd_readdir**: O(m) where m = entries in directory
+- **rd_rename**: O(1) for file, O(depth) for directory cycle detection
 
 ### Space overhead
 - **Superblock**: 1 block (stores metadata)
@@ -179,21 +180,31 @@ Functions return `RD_OK` (0) or negative `rd_err` codes:
 ## Current limitations
 - No permissions enforcement beyond simple mode checks; no users/groups.
 - No journaling or crash recovery; backing flush is incremental (dirty blocks only) but not atomic.
-- No hard links or symlinks; no rename; no fsync per file (only full flush via `rd_block_flush`).
+- No hard links or symlinks.
 - Single-device, in-process only; not mounted into the OS VFS.
 - Handle table grows dynamically but caps at 1024 open files per device.
 
-## Recent improvements (v0.3)
+## Recent improvements (v0.4)
+- **O(1) allocation**: Free list-based block and inode allocation for constant-time performance
+  - Previous O(n) linear search replaced with linked free lists
+  - Dramatically faster allocation on large devices
+- **Rename operation**: Full rd_rename() implementation with cycle detection
+  - Supports file and directory renames
+  - Handles overwrites with proper checks
+  - Detects and prevents directory cycles
+- **Per-file fsync**: rd_fsync() flushes specific file's blocks to backing storage
+  - More efficient than full rd_block_flush() for single file updates
+  - Flushes file data, metadata, and directory entries
 - **Thread safety**: Full thread-safe implementation using pthread read-write locks
   - Multiple concurrent readers for maximum performance
   - Exclusive write locking for modifications
   - Separate handle table mutex for minimal contention
-  - Tested with all existing test suite (16 tests passing)
 - **Double indirect blocks**: Files can now grow up to ~4GB (with 4KB blocks) instead of ~4MB
 - **Incremental backing flush**: Only dirty blocks written to backing file, dramatically faster for large devices
-- **Dynamic file handles**: Handle table grows from 64 to 1024 as needed, no hard limit on concurrent opens
-- **Dirty tracking**: Backing file writes are now O(d) where d = dirty blocks, not O(n) where n = total blocks
+- **Dynamic file handles**: Handle table grows from 64 to 1024 as needed
+- **Dirty tracking**: Backing file writes are now O(d) where d = dirty blocks
 
 ## Testing
 - Build and run: `ctest --test-dir build --output-on-failure`.
-- Coverage includes: mount/format, create/read/write/seek, directory listing, unlink/rmdir rules, indirect-block I/O, ENOSPC behavior, block API sanity, and backing persistence across remounts.
+- Coverage includes: mount/format, create/read/write/seek, directory listing, unlink/rmdir rules, indirect-block I/O, ENOSPC behavior, block API sanity, backing persistence across remounts, rename operations, per-file fsync, thread safety.
+- 18 tests total, all passing.

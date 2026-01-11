@@ -31,6 +31,8 @@ struct rd_superblock {
     uint32_t inode_start;
     uint32_t data_start;
     uint32_t root_inode;
+    uint32_t free_block_head;  /* Head of free block linked list (0 = empty) */
+    uint32_t free_inode_head;  /* Head of free inode linked list (0 = empty) */
 };
 
 struct rd_inode {
@@ -42,7 +44,7 @@ struct rd_inode {
     uint32_t blocks[RD_MAX_DIRECT];
     uint32_t indirect;
     uint32_t double_indirect;
-    uint32_t reserved1;
+    uint32_t next_free;  /* Next inode in free list (was reserved1) */
     uint64_t atime;
     uint64_t mtime;
     uint64_t ctime;
@@ -201,24 +203,45 @@ static int rd_block_alloc(rd_device_t dev) {
     if (sb->free_blocks == 0) {
         return RD_ERR_NOSPC;
     }
-    uint32_t total = sb->block_count;
-    unsigned char* bm = rd_block_ptr(dev, sb->bitmap_start);
-    uint32_t bm_bytes = (total + 7u) / 8u;
-    for (uint32_t i = sb->data_start; i < total; ++i) {
-        uint32_t byte = i / 8;
-        uint32_t bit = i % 8;
-        if (byte >= bm_bytes) {
-            break;
+    
+    /* Pop from free list head */
+    uint32_t block_idx = sb->free_block_head;
+    if (block_idx == 0) {
+        /* Fallback to linear search if free list not initialized */
+        uint32_t total = sb->block_count;
+        unsigned char* bm = rd_block_ptr(dev, sb->bitmap_start);
+        uint32_t bm_bytes = (total + 7u) / 8u;
+        for (uint32_t i = sb->data_start; i < total; ++i) {
+            uint32_t byte = i / 8;
+            uint32_t bit = i % 8;
+            if (byte >= bm_bytes) {
+                break;
+            }
+            if ((bm[byte] & (1u << bit)) == 0) {
+                rd_bitmap_set(dev, i, 1);
+                sb->free_blocks--;
+                memset(rd_block_ptr(dev, i), 0, dev->block_size);
+                rd_mark_dirty(dev, i);
+                return (int)i;
+            }
         }
-        if ((bm[byte] & (1u << bit)) == 0) {
-            rd_bitmap_set(dev, i, 1);
-            sb->free_blocks--;
-            memset(rd_block_ptr(dev, i), 0, dev->block_size);
-            rd_mark_dirty(dev, i);
-            return (int)i;
-        }
+        return RD_ERR_NOSPC;
     }
-    return RD_ERR_NOSPC;
+    
+    /* Read next pointer from free block */
+    uint32_t* block_data = (uint32_t*)rd_block_ptr(dev, block_idx);
+    uint32_t next_free = block_data[0];
+    
+    /* Update free list head */
+    sb->free_block_head = next_free;
+    sb->free_blocks--;
+    
+    /* Mark as allocated and clear */
+    rd_bitmap_set(dev, block_idx, 1);
+    memset(rd_block_ptr(dev, block_idx), 0, dev->block_size);
+    rd_mark_dirty(dev, block_idx);
+    
+    return (int)block_idx;
 }
 
 static void rd_block_free(rd_device_t dev, uint32_t block_idx) {
@@ -229,6 +252,12 @@ static void rd_block_free(rd_device_t dev, uint32_t block_idx) {
     if (rd_bitmap_test(dev, block_idx)) {
         rd_bitmap_set(dev, block_idx, 0);
         sb->free_blocks++;
+        
+        /* Add to head of free list */
+        uint32_t* block_data = (uint32_t*)rd_block_ptr(dev, block_idx);
+        block_data[0] = sb->free_block_head;
+        sb->free_block_head = block_idx;
+        rd_mark_dirty(dev, block_idx);
     }
 }
 
@@ -237,14 +266,32 @@ static int rd_inode_alloc(rd_device_t dev) {
     if (sb->free_inodes == 0) {
         return RD_ERR_NOSPC;
     }
-    struct rd_inode* base = rd_inode_base(dev);
-    for (uint32_t i = 0; i < sb->inode_count; ++i) {
-        if (base[i].type == RD_FT_UNKNOWN && base[i].links == 0) {
-            sb->free_inodes--;
-            return (int)i;
+    
+    /* Pop from free list head */
+    uint32_t inode_idx = sb->free_inode_head;
+    if (inode_idx == 0) {
+        /* Fallback to linear search if free list not initialized */
+        struct rd_inode* base = rd_inode_base(dev);
+        for (uint32_t i = 0; i < sb->inode_count; ++i) {
+            if (base[i].type == RD_FT_UNKNOWN && base[i].links == 0) {
+                sb->free_inodes--;
+                return (int)i;
+            }
         }
+        return RD_ERR_NOSPC;
     }
-    return RD_ERR_NOSPC;
+    
+    /* Get inode and update free list */
+    struct rd_inode* in = rd_inode_get(dev, inode_idx);
+    if (!in) {
+        return RD_ERR_IO;
+    }
+    
+    uint32_t next_free = in->next_free;
+    sb->free_inode_head = next_free;
+    sb->free_inodes--;
+    
+    return (int)inode_idx;
 }
 
 static void rd_inode_free(rd_device_t dev, uint32_t idx) {
@@ -295,6 +342,10 @@ static void rd_inode_free(rd_device_t dev, uint32_t idx) {
         }
     }
     memset(in, 0, sizeof(*in));
+    
+    /* Add to head of free inode list */
+    in->next_free = sb->free_inode_head;
+    sb->free_inode_head = idx;
     sb->free_inodes++;
 }
 
@@ -436,9 +487,35 @@ static int rd_format(rd_device_t dev) {
     sb->root_inode = 0;
     sb->free_blocks = block_count - data_start;
     sb->free_inodes = inode_count - 1u;
+    sb->free_block_head = 0;  /* Will be initialized below */
+    sb->free_inode_head = 0;  /* Will be initialized below */
 
     for (uint32_t i = 0; i < data_start; ++i) {
         rd_bitmap_set(dev, i, 1);
+    }
+    
+    /* Initialize free block list - chain all free blocks */
+    sb->free_block_head = data_start;
+    for (uint32_t i = data_start; i < block_count; ++i) {
+        uint32_t* block_data = (uint32_t*)rd_block_ptr(dev, i);
+        if (i + 1 < block_count) {
+            block_data[0] = i + 1;  /* Next free block */
+        } else {
+            block_data[0] = 0;  /* End of list */
+        }
+    }
+    
+    /* Initialize free inode list - chain all free inodes except root (0) */
+    if (inode_count > 1) {
+        sb->free_inode_head = 1;
+        struct rd_inode* base = rd_inode_base(dev);
+        for (uint32_t i = 1; i < inode_count; ++i) {
+            if (i + 1 < inode_count) {
+                base[i].next_free = i + 1;
+            } else {
+                base[i].next_free = 0;  /* End of list */
+            }
+        }
     }
 
     struct rd_inode* root = rd_inode_get(dev, sb->root_inode);
@@ -1606,6 +1683,310 @@ RD_API int rd_readdir(rd_device_t dev, const char* path, rd_dirent_cb cb, void* 
         }
         off += de->rec_len;
     }
+    pthread_rwlock_unlock(&dev->fs_lock);
+    return RD_OK;
+}
+RD_API int rd_rename(rd_device_t dev, const char* old_path, const char* new_path) {
+    if (!dev || !old_path || !new_path) {
+        return RD_ERR_INVAL;
+    }
+    
+    pthread_rwlock_wrlock(&dev->fs_lock);
+    
+    /* Look up old path */
+    uint32_t old_inode = 0;
+    uint32_t old_parent = 0;
+    char old_leaf[RD_MAX_NAME];
+    int rc = rd_lookup(dev, old_path, &old_inode, &old_parent, old_leaf, sizeof(old_leaf));
+    if (rc != RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return rc;
+    }
+    
+    struct rd_inode* old_in = rd_inode_get(dev, old_inode);
+    if (!old_in) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return RD_ERR_INVAL;
+    }
+    
+    /* Look up new path */
+    uint32_t new_inode = 0;
+    uint32_t new_parent = 0;
+    char new_leaf[RD_MAX_NAME];
+    rc = rd_lookup(dev, new_path, &new_inode, &new_parent, new_leaf, sizeof(new_leaf));
+    
+    if (rc == RD_OK) {
+        /* Destination exists - need to replace it */
+        struct rd_inode* new_in = rd_inode_get(dev, new_inode);
+        if (!new_in) {
+            pthread_rwlock_unlock(&dev->fs_lock);
+            return RD_ERR_IO;
+        }
+        
+        /* Cannot rename over a non-empty directory */
+        if (new_in->type == RD_FT_DIR) {
+            if (!rd_is_dir_empty(dev, new_inode)) {
+                pthread_rwlock_unlock(&dev->fs_lock);
+                return RD_ERR_PERM;
+            }
+        }
+        
+        /* Cannot rename directory over file or vice versa */
+        if (old_in->type != new_in->type) {
+            pthread_rwlock_unlock(&dev->fs_lock);
+            return RD_ERR_PERM;
+        }
+        
+        /* Remove the target */
+        uint32_t removed = 0;
+        rc = rd_dir_remove(dev, new_parent, new_leaf, &removed);
+        if (rc != RD_OK) {
+            pthread_rwlock_unlock(&dev->fs_lock);
+            return rc;
+        }
+        
+        /* Free the target inode if it's not referenced */
+        if (new_in->links > 0) {
+            new_in->links--;
+        }
+        if (new_in->links == 0) {
+            rd_inode_free(dev, new_inode);
+        }
+    } else if (rc != RD_ERR_NOENT) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return rc;
+    }
+    
+    /* If new_leaf is empty, target parent doesn't exist */
+    if (new_leaf[0] == '\0') {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return RD_ERR_NOENT;
+    }
+    
+    /* Check for directory cycles - cannot rename dir into its own subtree */
+    if (old_in->type == RD_FT_DIR && new_parent != old_parent) {
+        /* Simple check: new_parent cannot be old_inode or a child of old_inode */
+        uint32_t check = new_parent;
+        struct rd_superblock* sb = rd_sb(dev);
+        while (check != sb->root_inode) {
+            if (check == old_inode) {
+                pthread_rwlock_unlock(&dev->fs_lock);
+                return RD_ERR_INVAL;  /* Would create cycle */
+            }
+            /* Get parent of check by looking up ".." */
+            uint32_t parent_ino = 0;
+            rc = rd_dir_find(dev, check, "..", &parent_ino, NULL);
+            if (rc != RD_OK || parent_ino == check) {
+                break;  /* Reached root or error */
+            }
+            check = parent_ino;
+        }
+    }
+    
+    /* Remove from old parent */
+    uint32_t removed = 0;
+    rc = rd_dir_remove(dev, old_parent, old_leaf, &removed);
+    if (rc != RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return rc;
+    }
+    
+    /* Add to new parent */
+    rc = rd_dir_add(dev, new_parent, old_inode, new_leaf, old_in->type);
+    if (rc != RD_OK) {
+        /* Try to restore old entry - if this fails, we've lost the file */
+        rd_dir_add(dev, old_parent, old_inode, old_leaf, old_in->type);
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return rc;
+    }
+    
+    /* Update parent links if moving directory between different parents */
+    if (old_in->type == RD_FT_DIR && old_parent != new_parent) {
+        struct rd_inode* old_parent_in = rd_inode_get(dev, old_parent);
+        if (old_parent_in && old_parent_in->links > 0) {
+            old_parent_in->links--;
+        }
+        
+        struct rd_inode* new_parent_in = rd_inode_get(dev, new_parent);
+        if (new_parent_in) {
+            new_parent_in->links++;
+        }
+        
+        /* Update ".." in moved directory to point to new parent */
+        uint32_t dotdot_ino = 0;
+        rc = rd_dir_find(dev, old_inode, "..", &dotdot_ino, NULL);
+        if (rc == RD_OK) {
+            uint32_t removed_dotdot = 0;
+            rd_dir_remove(dev, old_inode, "..", &removed_dotdot);
+            rd_dir_add(dev, old_inode, new_parent, "..", RD_FT_DIR);
+        }
+    }
+    
+    old_in->ctime = rd_now_ns();
+    pthread_rwlock_unlock(&dev->fs_lock);
+    return RD_OK;
+}
+
+RD_API int rd_fsync(rd_device_t dev, rd_fd fd) {
+    if (!dev) {
+        return RD_ERR_INVAL;
+    }
+    
+    struct rd_handle* h = rd_handle_get(dev, fd);
+    if (!h) {
+        return RD_ERR_INVAL;
+    }
+    
+    uint32_t inode_idx = h->inode_idx;
+    rd_handle_release(dev);
+    
+    if (!dev->backing_file) {
+        return RD_OK;  /* No backing file, nothing to sync */
+    }
+    
+    pthread_rwlock_rdlock(&dev->fs_lock);
+    
+    struct rd_inode* in = rd_inode_get(dev, inode_idx);
+    if (!in) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return RD_ERR_INVAL;
+    }
+    
+    struct rd_superblock* sb = rd_sb(dev);
+    
+    /* Flush superblock */
+    if (fseek(dev->backing_file, 0, SEEK_SET) != 0) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return RD_ERR_IO;
+    }
+    if (fwrite(dev->data, dev->block_size, 1, dev->backing_file) != 1) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return RD_ERR_IO;
+    }
+    
+    /* Flush inode table blocks containing this inode */
+    uint32_t inode_block = inode_idx / (dev->block_size / sizeof(struct rd_inode));
+    uint32_t inode_block_abs = sb->inode_start + inode_block;
+    size_t offset = (size_t)inode_block_abs * dev->block_size;
+    if (fseek(dev->backing_file, (long)offset, SEEK_SET) != 0) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return RD_ERR_IO;
+    }
+    if (fwrite(dev->data + offset, dev->block_size, 1, dev->backing_file) != 1) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        return RD_ERR_IO;
+    }
+    
+    /* Flush bitmap blocks */
+    for (uint32_t i = 0; i < (sb->block_count + 7) / 8 / dev->block_size + 1; ++i) {
+        uint32_t bm_block = sb->bitmap_start + i;
+        if (bm_block >= sb->block_count) break;
+        offset = (size_t)bm_block * dev->block_size;
+        if (fseek(dev->backing_file, (long)offset, SEEK_SET) != 0) {
+            pthread_rwlock_unlock(&dev->fs_lock);
+            return RD_ERR_IO;
+        }
+        if (fwrite(dev->data + offset, dev->block_size, 1, dev->backing_file) != 1) {
+            pthread_rwlock_unlock(&dev->fs_lock);
+            return RD_ERR_IO;
+        }
+    }
+    
+    /* Flush all data blocks belonging to this file */
+    /* Direct blocks */
+    for (size_t i = 0; i < RD_MAX_DIRECT; ++i) {
+        if (in->blocks[i]) {
+            offset = (size_t)in->blocks[i] * dev->block_size;
+            if (fseek(dev->backing_file, (long)offset, SEEK_SET) != 0) {
+                pthread_rwlock_unlock(&dev->fs_lock);
+                return RD_ERR_IO;
+            }
+            if (fwrite(dev->data + offset, dev->block_size, 1, dev->backing_file) != 1) {
+                pthread_rwlock_unlock(&dev->fs_lock);
+                return RD_ERR_IO;
+            }
+        }
+    }
+    
+    /* Indirect block */
+    if (in->indirect) {
+        offset = (size_t)in->indirect * dev->block_size;
+        if (fseek(dev->backing_file, (long)offset, SEEK_SET) != 0) {
+            pthread_rwlock_unlock(&dev->fs_lock);
+            return RD_ERR_IO;
+        }
+        if (fwrite(dev->data + offset, dev->block_size, 1, dev->backing_file) != 1) {
+            pthread_rwlock_unlock(&dev->fs_lock);
+            return RD_ERR_IO;
+        }
+        
+        /* Flush indirect data blocks */
+        uint32_t* table = (uint32_t*)rd_block_ptr(dev, in->indirect);
+        size_t limit = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
+        for (size_t i = 0; i < limit; ++i) {
+            if (table[i]) {
+                offset = (size_t)table[i] * dev->block_size;
+                if (fseek(dev->backing_file, (long)offset, SEEK_SET) != 0) {
+                    pthread_rwlock_unlock(&dev->fs_lock);
+                    return RD_ERR_IO;
+                }
+                if (fwrite(dev->data + offset, dev->block_size, 1, dev->backing_file) != 1) {
+                    pthread_rwlock_unlock(&dev->fs_lock);
+                    return RD_ERR_IO;
+                }
+            }
+        }
+    }
+    
+    /* Double indirect block */
+    if (in->double_indirect) {
+        offset = (size_t)in->double_indirect * dev->block_size;
+        if (fseek(dev->backing_file, (long)offset, SEEK_SET) != 0) {
+            pthread_rwlock_unlock(&dev->fs_lock);
+            return RD_ERR_IO;
+        }
+        if (fwrite(dev->data + offset, dev->block_size, 1, dev->backing_file) != 1) {
+            pthread_rwlock_unlock(&dev->fs_lock);
+            return RD_ERR_IO;
+        }
+        
+        /* Flush double indirect tables and data blocks */
+        uint32_t* di_table = (uint32_t*)rd_block_ptr(dev, in->double_indirect);
+        size_t di_limit = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
+        for (size_t i = 0; i < di_limit; ++i) {
+            if (di_table[i]) {
+                /* Flush indirect table */
+                offset = (size_t)di_table[i] * dev->block_size;
+                if (fseek(dev->backing_file, (long)offset, SEEK_SET) != 0) {
+                    pthread_rwlock_unlock(&dev->fs_lock);
+                    return RD_ERR_IO;
+                }
+                if (fwrite(dev->data + offset, dev->block_size, 1, dev->backing_file) != 1) {
+                    pthread_rwlock_unlock(&dev->fs_lock);
+                    return RD_ERR_IO;
+                }
+                
+                /* Flush data blocks */
+                uint32_t* table = (uint32_t*)rd_block_ptr(dev, di_table[i]);
+                size_t limit = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
+                for (size_t j = 0; j < limit; ++j) {
+                    if (table[j]) {
+                        offset = (size_t)table[j] * dev->block_size;
+                        if (fseek(dev->backing_file, (long)offset, SEEK_SET) != 0) {
+                            pthread_rwlock_unlock(&dev->fs_lock);
+                            return RD_ERR_IO;
+                        }
+                        if (fwrite(dev->data + offset, dev->block_size, 1, dev->backing_file) != 1) {
+                            pthread_rwlock_unlock(&dev->fs_lock);
+                            return RD_ERR_IO;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fflush(dev->backing_file);
     pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
 }
