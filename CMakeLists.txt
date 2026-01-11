@@ -48,6 +48,11 @@ else()
     target_compile_options(ramdisc PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# Link pthread for thread safety
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+target_link_libraries(ramdisc PRIVATE Threads::Threads)
+
 if(RD_BUILD_STATIC)
     target_include_directories(ramdisc_static
         PUBLIC

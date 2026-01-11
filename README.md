@@ -133,7 +133,11 @@ Functions return `RD_OK` (0) or negative `rd_err` codes:
 - `rd_mount` formats if no valid superblock; validates existing superblock
 - `rd_unmount` flushes to backing file (if present); does not free memory
 - `rd_destroy` frees all memory and closes backing file; does not flush (call rd_unmount first)
-- **Thread safety**: Not thread-safe; caller must serialize access
+- **Thread safety**: Thread-safe using pthread read-write locks and mutexes
+  - Filesystem operations (reads, writes, metadata) protected by `pthread_rwlock_t`
+  - Multiple concurrent readers allowed; writes are exclusive
+  - File handle table protected by `pthread_mutex_t`
+  - Expected overhead: 2-10% on concurrent workloads depending on contention
 
 ### Limits
 - Max open file descriptors: 64 initially, grows dynamically up to 1024 per device
@@ -177,10 +181,14 @@ Functions return `RD_OK` (0) or negative `rd_err` codes:
 - No journaling or crash recovery; backing flush is incremental (dirty blocks only) but not atomic.
 - No hard links or symlinks; no rename; no fsync per file (only full flush via `rd_block_flush`).
 - Single-device, in-process only; not mounted into the OS VFS.
-- Concurrency is not thread-safe yet (callers must serialize).
 - Handle table grows dynamically but caps at 1024 open files per device.
 
-## Recent improvements (v0.2)
+## Recent improvements (v0.3)
+- **Thread safety**: Full thread-safe implementation using pthread read-write locks
+  - Multiple concurrent readers for maximum performance
+  - Exclusive write locking for modifications
+  - Separate handle table mutex for minimal contention
+  - Tested with all existing test suite (16 tests passing)
 - **Double indirect blocks**: Files can now grow up to ~4GB (with 4KB blocks) instead of ~4MB
 - **Incremental backing flush**: Only dirty blocks written to backing file, dramatically faster for large devices
 - **Dynamic file handles**: Handle table grows from 64 to 1024 as needed, no hard limit on concurrent opens

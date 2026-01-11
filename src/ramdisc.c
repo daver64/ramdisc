@@ -1,6 +1,7 @@
 #include "ramdisc.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,8 @@ struct rd_device {
     struct rd_handle* handles;
     size_t handle_capacity;
     unsigned char* dirty_bitmap;
+    pthread_rwlock_t fs_lock;    /* Protects filesystem structures (superblock, bitmap, inodes, dirs) */
+    pthread_mutex_t handle_lock;  /* Protects handle table */
 };
 
 static void rd_free_aligned(void* ptr) {
@@ -742,7 +745,7 @@ static int rd_grow_file(rd_device_t dev, struct rd_inode* in, size_t new_size) {
 
 static ssize_t rd_rw_core(rd_device_t dev, rd_fd fd, const void* in_buf, void* out_buf, size_t len, size_t off, int write_mode) {
     struct rd_handle* h = NULL;
-    if (fd >= 0 && fd < RD_MAX_HANDLES) {
+    if (fd >= 0 && (size_t)fd < dev->handle_capacity) {
         h = &dev->handles[fd];
     }
     if (!h || !h->used) {
@@ -841,10 +844,25 @@ RD_API rd_device_t rd_create(size_t size_bytes,
     dev->size_bytes = size_bytes;
     dev->block_size = block_size;
     
+    /* Initialize locks */
+    if (pthread_rwlock_init(&dev->fs_lock, NULL) != 0) {
+        free(dev);
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (pthread_mutex_init(&dev->handle_lock, NULL) != 0) {
+        pthread_rwlock_destroy(&dev->fs_lock);
+        free(dev);
+        errno = ENOMEM;
+        return NULL;
+    }
+    
     /* Initialize dynamic handle table */
     dev->handle_capacity = RD_MAX_HANDLES;
     dev->handles = (struct rd_handle*)calloc(dev->handle_capacity, sizeof(struct rd_handle));
     if (!dev->handles) {
+        pthread_mutex_destroy(&dev->handle_lock);
+        pthread_rwlock_destroy(&dev->fs_lock);
         free(dev);
         errno = ENOMEM;
         return NULL;
@@ -899,6 +917,8 @@ RD_API rd_device_t rd_create(size_t size_bytes,
         }
         free(dev->backing_path);
         free(dev->handles);
+        pthread_mutex_destroy(&dev->handle_lock);
+        pthread_rwlock_destroy(&dev->fs_lock);
         free(dev);
         errno = ENOMEM;
         return NULL;
@@ -917,6 +937,8 @@ RD_API rd_device_t rd_create(size_t size_bytes,
             }
             free(dev->backing_path);
             free(dev->handles);
+            pthread_mutex_destroy(&dev->handle_lock);
+            pthread_rwlock_destroy(&dev->fs_lock);
             free(dev);
             errno = ENOMEM;
             return NULL;
@@ -936,18 +958,25 @@ RD_API int rd_mount(rd_device_t dev) {
     if (!dev) {
         return RD_ERR_INVAL;
     }
+    pthread_rwlock_wrlock(&dev->fs_lock);
     struct rd_superblock* sb = rd_sb(dev);
+    int rc;
     if (sb->magic != RD_MAGIC) {
-        return rd_format(dev);
+        rc = rd_format(dev);
+    } else {
+        rc = rd_mount_existing(dev);
     }
-    return rd_mount_existing(dev);
+    pthread_rwlock_unlock(&dev->fs_lock);
+    return rc;
 }
 
 RD_API int rd_unmount(rd_device_t dev) {
     if (!dev) {
         return RD_ERR_INVAL;
     }
+    pthread_rwlock_wrlock(&dev->fs_lock);
     int rc = rd_block_flush(dev);
+    pthread_rwlock_unlock(&dev->fs_lock);
     if (rc != RD_OK) {
         return rc;
     }
@@ -965,6 +994,8 @@ RD_API void rd_destroy(rd_device_t dev) {
     free(dev->backing_path);
     free(dev->handles);
     free(dev->dirty_bitmap);
+    pthread_mutex_destroy(&dev->handle_lock);
+    pthread_rwlock_destroy(&dev->fs_lock);
     free(dev);
 }
 
@@ -980,7 +1011,9 @@ RD_API ssize_t rd_block_read(rd_device_t dev,
     if (offset > dev->size_bytes || len > dev->size_bytes || offset + len > dev->size_bytes) {
         return RD_ERR_RANGE;
     }
+    pthread_rwlock_rdlock(&dev->fs_lock);
     memcpy(buf, dev->data + offset, len);
+    pthread_rwlock_unlock(&dev->fs_lock);
     return (ssize_t)block_count;
 }
 
@@ -996,11 +1029,13 @@ RD_API ssize_t rd_block_write(rd_device_t dev,
     if (offset > dev->size_bytes || len > dev->size_bytes || offset + len > dev->size_bytes) {
         return RD_ERR_RANGE;
     }
+    pthread_rwlock_wrlock(&dev->fs_lock);
     memcpy(dev->data + offset, buf, len);
     /* Mark written blocks as dirty */
     for (size_t i = 0; i < block_count; ++i) {
         rd_mark_dirty(dev, (uint32_t)(block_idx + i));
     }
+    pthread_rwlock_unlock(&dev->fs_lock);
     return (ssize_t)block_count;
 }
 
@@ -1008,6 +1043,7 @@ RD_API int rd_block_flush(rd_device_t dev) {
     if (!dev) {
         return RD_ERR_INVAL;
     }
+    pthread_rwlock_rdlock(&dev->fs_lock);
     if (dev->backing_file) {
         struct rd_superblock* sb = rd_sb(dev);
         if (dev->dirty_bitmap) {
@@ -1035,15 +1071,19 @@ RD_API int rd_block_flush(rd_device_t dev) {
         }
         fflush(dev->backing_file);
     }
+    pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
 }
 
 static int rd_handle_alloc(rd_device_t dev) {
+    pthread_mutex_lock(&dev->handle_lock);
+    
     /* First, try to find an unused handle */
     for (size_t i = 0; i < dev->handle_capacity; ++i) {
         if (!dev->handles[i].used) {
             dev->handles[i].used = 1;
             dev->handles[i].offset = 0;
+            pthread_mutex_unlock(&dev->handle_lock);
             return (int)i;
         }
     }
@@ -1052,12 +1092,14 @@ static int rd_handle_alloc(rd_device_t dev) {
     size_t new_capacity = dev->handle_capacity * 2;
     if (new_capacity > 1024) {
         /* Cap at 1024 handles to prevent excessive growth */
+        pthread_mutex_unlock(&dev->handle_lock);
         return RD_ERR_NOSPC;
     }
     
     struct rd_handle* new_handles = (struct rd_handle*)realloc(
         dev->handles, new_capacity * sizeof(struct rd_handle));
     if (!new_handles) {
+        pthread_mutex_unlock(&dev->handle_lock);
         return RD_ERR_NOMEM;
     }
     
@@ -1071,36 +1113,51 @@ static int rd_handle_alloc(rd_device_t dev) {
     
     dev->handles[idx].used = 1;
     dev->handles[idx].offset = 0;
+    pthread_mutex_unlock(&dev->handle_lock);
     return (int)idx;
 }
 
 static struct rd_handle* rd_handle_get(rd_device_t dev, rd_fd fd) {
+    pthread_mutex_lock(&dev->handle_lock);
     if (fd < 0 || (size_t)fd >= dev->handle_capacity) {
+        pthread_mutex_unlock(&dev->handle_lock);
         return NULL;
     }
     if (!dev->handles[fd].used) {
+        pthread_mutex_unlock(&dev->handle_lock);
         return NULL;
     }
+    /* Note: We keep the lock held and return pointer - caller must call rd_handle_release */
     return &dev->handles[fd];
+}
+
+static void rd_handle_release(rd_device_t dev) {
+    pthread_mutex_unlock(&dev->handle_lock);
 }
 
 RD_API rd_fd rd_open(rd_device_t dev, const char* path, unsigned flags, unsigned mode) {
     if (!dev || !path) {
         return RD_ERR_INVAL;
     }
+    
+    pthread_rwlock_wrlock(&dev->fs_lock);
+    
     uint32_t inode = 0;
     uint32_t parent = 0;
     char leaf[RD_MAX_NAME];
     int rc = rd_lookup(dev, path, &inode, &parent, leaf, sizeof(leaf));
     if (rc == RD_ERR_NOENT) {
         if (!(flags & RD_O_CREATE)) {
+            pthread_rwlock_unlock(&dev->fs_lock);
             return RD_ERR_NOENT;
         }
         if (leaf[0] == '\0') {
+            pthread_rwlock_unlock(&dev->fs_lock);
             return RD_ERR_INVAL;
         }
         int new_inode = rd_inode_alloc(dev);
         if (new_inode < 0) {
+            pthread_rwlock_unlock(&dev->fs_lock);
             return new_inode;
         }
         struct rd_inode* in = rd_inode_get(dev, (uint32_t)new_inode);
@@ -1112,20 +1169,25 @@ RD_API rd_fd rd_open(rd_device_t dev, const char* path, unsigned flags, unsigned
         rc = rd_dir_add(dev, parent, (uint32_t)new_inode, leaf, RD_FT_FILE);
         if (rc != RD_OK) {
             rd_inode_free(dev, (uint32_t)new_inode);
+            pthread_rwlock_unlock(&dev->fs_lock);
             return rc;
         }
         inode = (uint32_t)new_inode;
     } else if (rc == RD_OK && (flags & RD_O_EXCL) && (flags & RD_O_CREATE)) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_EXIST;
     } else if (rc != RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
 
     struct rd_inode* in = rd_inode_get(dev, inode);
     if (!in) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_INVAL;
     }
     if (in->type == RD_FT_DIR && (flags & (RD_O_WRONLY | RD_O_RDWR))) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_PERM;
     }
     if ((flags & RD_O_TRUNC) && in->type == RD_FT_FILE) {
@@ -1173,11 +1235,13 @@ RD_API rd_fd rd_open(rd_device_t dev, const char* path, unsigned flags, unsigned
 
     int hidx = rd_handle_alloc(dev);
     if (hidx < 0) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return hidx;
     }
     dev->handles[hidx].inode_idx = inode;
     dev->handles[hidx].flags = flags;
     dev->handles[hidx].offset = (flags & RD_O_APPEND) ? in->size : 0;
+    pthread_rwlock_unlock(&dev->fs_lock);
     return hidx;
 }
 
@@ -1189,9 +1253,19 @@ RD_API ssize_t rd_read(rd_device_t dev, rd_fd fd, void* buf, size_t len) {
     if (!h) {
         return RD_ERR_INVAL;
     }
-    ssize_t r = rd_rw_core(dev, fd, NULL, buf, len, h->offset, 0);
+    size_t offset = h->offset;
+    rd_handle_release(dev);
+    
+    pthread_rwlock_rdlock(&dev->fs_lock);
+    ssize_t r = rd_rw_core(dev, fd, NULL, buf, len, offset, 0);
+    pthread_rwlock_unlock(&dev->fs_lock);
+    
     if (r >= 0) {
-        h->offset += (size_t)r;
+        pthread_mutex_lock(&dev->handle_lock);
+        if (fd >= 0 && (size_t)fd < dev->handle_capacity && dev->handles[fd].used) {
+            dev->handles[fd].offset += (size_t)r;
+        }
+        pthread_mutex_unlock(&dev->handle_lock);
     }
     return r;
 }
@@ -1204,9 +1278,19 @@ RD_API ssize_t rd_write(rd_device_t dev, rd_fd fd, const void* buf, size_t len) 
     if (!h) {
         return RD_ERR_INVAL;
     }
-    ssize_t r = rd_rw_core(dev, fd, buf, NULL, len, h->offset, 1);
+    size_t offset = h->offset;
+    rd_handle_release(dev);
+    
+    pthread_rwlock_wrlock(&dev->fs_lock);
+    ssize_t r = rd_rw_core(dev, fd, buf, NULL, len, offset, 1);
+    pthread_rwlock_unlock(&dev->fs_lock);
+    
     if (r >= 0) {
-        h->offset += (size_t)r;
+        pthread_mutex_lock(&dev->handle_lock);
+        if (fd >= 0 && (size_t)fd < dev->handle_capacity && dev->handles[fd].used) {
+            dev->handles[fd].offset += (size_t)r;
+        }
+        pthread_mutex_unlock(&dev->handle_lock);
     }
     return r;
 }
@@ -1215,14 +1299,20 @@ RD_API ssize_t rd_pread(rd_device_t dev, rd_fd fd, void* buf, size_t len, size_t
     if (!dev || !buf) {
         return RD_ERR_INVAL;
     }
-    return rd_rw_core(dev, fd, NULL, buf, len, off, 0);
+    pthread_rwlock_rdlock(&dev->fs_lock);
+    ssize_t r = rd_rw_core(dev, fd, NULL, buf, len, off, 0);
+    pthread_rwlock_unlock(&dev->fs_lock);
+    return r;
 }
 
 RD_API ssize_t rd_pwrite(rd_device_t dev, rd_fd fd, const void* buf, size_t len, size_t off) {
     if (!dev || !buf) {
         return RD_ERR_INVAL;
     }
-    return rd_rw_core(dev, fd, buf, NULL, len, off, 1);
+    pthread_rwlock_wrlock(&dev->fs_lock);
+    ssize_t r = rd_rw_core(dev, fd, buf, NULL, len, off, 1);
+    pthread_rwlock_unlock(&dev->fs_lock);
+    return r;
 }
 
 RD_API int rd_seek(rd_device_t dev, rd_fd fd, long long off, int whence) {
@@ -1230,8 +1320,12 @@ RD_API int rd_seek(rd_device_t dev, rd_fd fd, long long off, int whence) {
     if (!h) {
         return RD_ERR_INVAL;
     }
+    
+    pthread_rwlock_rdlock(&dev->fs_lock);
     struct rd_inode* in = rd_inode_get(dev, h->inode_idx);
     if (!in) {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        rd_handle_release(dev);
         return RD_ERR_INVAL;
     }
     
@@ -1243,13 +1337,18 @@ RD_API int rd_seek(rd_device_t dev, rd_fd fd, long long off, int whence) {
     } else if (whence == 2 || whence == SEEK_END) {
         new_offset = (long long)in->size + off;
     } else {
+        pthread_rwlock_unlock(&dev->fs_lock);
+        rd_handle_release(dev);
         return RD_ERR_INVAL;
     }
+    pthread_rwlock_unlock(&dev->fs_lock);
     
     if (new_offset < 0) {
+        rd_handle_release(dev);
         return RD_ERR_INVAL;
     }
     h->offset = (size_t)new_offset;
+    rd_handle_release(dev);
     return RD_OK;
 }
 
@@ -1259,16 +1358,23 @@ RD_API int rd_close(rd_device_t dev, rd_fd fd) {
         return RD_ERR_INVAL;
     }
     memset(h, 0, sizeof(*h));
+    rd_handle_release(dev);
     return RD_OK;
 }
 
 RD_API int rd_fstat(rd_device_t dev, rd_fd fd, rd_stat_info* st) {
     struct rd_handle* h = rd_handle_get(dev, fd);
     if (!h || !st) {
+        if (h) rd_handle_release(dev);
         return RD_ERR_INVAL;
     }
-    struct rd_inode* in = rd_inode_get(dev, h->inode_idx);
+    uint32_t inode_idx = h->inode_idx;
+    rd_handle_release(dev);
+    
+    pthread_rwlock_rdlock(&dev->fs_lock);
+    struct rd_inode* in = rd_inode_get(dev, inode_idx);
     if (!in) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_INVAL;
     }
     st->size_bytes = in->size;
@@ -1278,6 +1384,7 @@ RD_API int rd_fstat(rd_device_t dev, rd_fd fd, rd_stat_info* st) {
     st->mtime_ns = in->mtime;
     st->ctime_ns = in->ctime;
     st->link_count = in->links;
+    pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
 }
 
@@ -1285,13 +1392,16 @@ RD_API int rd_stat(rd_device_t dev, const char* path, rd_stat_info* st) {
     if (!dev || !path || !st) {
         return RD_ERR_INVAL;
     }
+    pthread_rwlock_rdlock(&dev->fs_lock);
     uint32_t inode = 0;
     int rc = rd_lookup(dev, path, &inode, NULL, NULL, 0);
     if (rc != RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
     struct rd_inode* in = rd_inode_get(dev, inode);
     if (!in) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_INVAL;
     }
     st->size_bytes = in->size;
@@ -1301,6 +1411,7 @@ RD_API int rd_stat(rd_device_t dev, const char* path, rd_stat_info* st) {
     st->mtime_ns = in->mtime;
     st->ctime_ns = in->ctime;
     st->link_count = in->links;
+    pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
 }
 
@@ -1308,26 +1419,32 @@ RD_API int rd_unlink(rd_device_t dev, const char* path) {
     if (!dev || !path) {
         return RD_ERR_INVAL;
     }
+    pthread_rwlock_wrlock(&dev->fs_lock);
     uint32_t inode = 0;
     uint32_t parent = 0;
     char leaf[RD_MAX_NAME];
     int rc = rd_lookup(dev, path, &inode, &parent, leaf, sizeof(leaf));
     if (rc != RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
     if (leaf[0] == '\0') {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_PERM;
     }
     struct rd_inode* in = rd_inode_get(dev, inode);
     if (!in || in->type == RD_FT_DIR) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_PERM;
     }
     uint32_t removed = 0;
     rc = rd_dir_remove(dev, parent, leaf, &removed);
     if (rc != RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
     if (removed != inode) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_IO;
     }
     if (in->links > 0) {
@@ -1336,6 +1453,7 @@ RD_API int rd_unlink(rd_device_t dev, const char* path) {
     if (in->links == 0) {
         rd_inode_free(dev, inode);
     }
+    pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
 }
 
@@ -1343,18 +1461,22 @@ RD_API int rd_mkdir(rd_device_t dev, const char* path) {
     if (!dev || !path) {
         return RD_ERR_INVAL;
     }
+    pthread_rwlock_wrlock(&dev->fs_lock);
     uint32_t inode = 0;
     uint32_t parent = 0;
     char leaf[RD_MAX_NAME];
     int rc = rd_lookup(dev, path, &inode, &parent, leaf, sizeof(leaf));
     if (rc == RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_EXIST;
     }
     if (rc != RD_ERR_NOENT || leaf[0] == '\0') {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
     int new_inode = rd_inode_alloc(dev);
     if (new_inode < 0) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return new_inode;
     }
     struct rd_inode* dir = rd_inode_get(dev, (uint32_t)new_inode);
@@ -1366,6 +1488,7 @@ RD_API int rd_mkdir(rd_device_t dev, const char* path) {
     int blk = rd_block_alloc(dev);
     if (blk < 0) {
         rd_inode_free(dev, (uint32_t)new_inode);
+        pthread_rwlock_unlock(&dev->fs_lock);
         return blk;
     }
     dir->blocks[0] = (uint32_t)blk;
@@ -1373,6 +1496,7 @@ RD_API int rd_mkdir(rd_device_t dev, const char* path) {
     rc = rd_dir_add(dev, (uint32_t)new_inode, (uint32_t)new_inode, ".", RD_FT_DIR);
     if (rc != RD_OK) {
         rd_inode_free(dev, (uint32_t)new_inode);
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
     rc = rd_dir_add(dev, (uint32_t)new_inode, parent, "..", RD_FT_DIR);
@@ -1380,14 +1504,17 @@ RD_API int rd_mkdir(rd_device_t dev, const char* path) {
         /* Clean up the "." entry by clearing the directory */
         dir->size = 0;
         rd_inode_free(dev, (uint32_t)new_inode);
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
     rc = rd_dir_add(dev, parent, (uint32_t)new_inode, leaf, RD_FT_DIR);
     if (rc != RD_OK) {
         /* Directory entries are cleaned by rd_inode_free */
         rd_inode_free(dev, (uint32_t)new_inode);
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
+    pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
 }
 
@@ -1395,32 +1522,40 @@ RD_API int rd_rmdir(rd_device_t dev, const char* path) {
     if (!dev || !path) {
         return RD_ERR_INVAL;
     }
+    pthread_rwlock_wrlock(&dev->fs_lock);
     uint32_t inode = 0;
     uint32_t parent = 0;
     char leaf[RD_MAX_NAME];
     int rc = rd_lookup(dev, path, &inode, &parent, leaf, sizeof(leaf));
     if (rc != RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
     if (leaf[0] == '\0') {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_PERM;
     }
     struct rd_inode* dir = rd_inode_get(dev, inode);
     if (!dir || dir->type != RD_FT_DIR) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_PERM;
     }
     if (!rd_is_dir_empty(dev, inode)) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_PERM;
     }
     uint32_t removed = 0;
     rc = rd_dir_remove(dev, parent, leaf, &removed);
     if (rc != RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
     if (removed != inode) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_IO;
     }
     rd_inode_free(dev, inode);
+    pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
 }
 
@@ -1428,13 +1563,16 @@ RD_API int rd_readdir(rd_device_t dev, const char* path, rd_dirent_cb cb, void* 
     if (!dev || !path || !cb) {
         return RD_ERR_INVAL;
     }
+    pthread_rwlock_rdlock(&dev->fs_lock);
     uint32_t inode = 0;
     int rc = rd_lookup(dev, path, &inode, NULL, NULL, 0);
     if (rc != RD_OK) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
     struct rd_inode* dir = rd_inode_get(dev, inode);
     if (!dir || dir->type != RD_FT_DIR) {
+        pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_INVAL;
     }
     size_t off = 0;
@@ -1468,5 +1606,6 @@ RD_API int rd_readdir(rd_device_t dev, const char* path, rd_dirent_cb cb, void* 
         }
         off += de->rec_len;
     }
+    pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
 }
