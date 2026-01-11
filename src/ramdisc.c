@@ -40,6 +40,8 @@ struct rd_inode {
     uint64_t size;
     uint32_t blocks[RD_MAX_DIRECT];
     uint32_t indirect;
+    uint32_t double_indirect;
+    uint32_t reserved1;
     uint64_t atime;
     uint64_t mtime;
     uint64_t ctime;
@@ -67,7 +69,9 @@ struct rd_device {
     char* backing_path;
     FILE* backing_file;
     int backing_present;
-    struct rd_handle handles[RD_MAX_HANDLES];
+    struct rd_handle* handles;
+    size_t handle_capacity;
+    unsigned char* dirty_bitmap;
 };
 
 static void rd_free_aligned(void* ptr) {
@@ -150,6 +154,45 @@ static void rd_bitmap_set(rd_device_t dev, uint32_t block_idx, int value) {
     }
 }
 
+static void rd_mark_dirty(rd_device_t dev, uint32_t block_idx) {
+    if (!dev->dirty_bitmap) {
+        return;
+    }
+    struct rd_superblock* sb = rd_sb(dev);
+    if (block_idx >= sb->block_count) {
+        return;
+    }
+    uint32_t byte = block_idx / 8;
+    uint32_t bit = block_idx % 8;
+    dev->dirty_bitmap[byte] |= (unsigned char)(1u << bit);
+}
+
+static int rd_is_dirty(rd_device_t dev, uint32_t block_idx) {
+    if (!dev->dirty_bitmap) {
+        return 1; /* Assume dirty if no tracking */
+    }
+    struct rd_superblock* sb = rd_sb(dev);
+    if (block_idx >= sb->block_count) {
+        return 0;
+    }
+    uint32_t byte = block_idx / 8;
+    uint32_t bit = block_idx % 8;
+    return (dev->dirty_bitmap[byte] >> bit) & 1u;
+}
+
+static void rd_clear_dirty(rd_device_t dev, uint32_t block_idx) {
+    if (!dev->dirty_bitmap) {
+        return;
+    }
+    struct rd_superblock* sb = rd_sb(dev);
+    if (block_idx >= sb->block_count) {
+        return;
+    }
+    uint32_t byte = block_idx / 8;
+    uint32_t bit = block_idx % 8;
+    dev->dirty_bitmap[byte] &= (unsigned char)~(1u << bit);
+}
+
 static int rd_block_alloc(rd_device_t dev) {
     struct rd_superblock* sb = rd_sb(dev);
     if (sb->free_blocks == 0) {
@@ -168,6 +211,7 @@ static int rd_block_alloc(rd_device_t dev) {
             rd_bitmap_set(dev, i, 1);
             sb->free_blocks--;
             memset(rd_block_ptr(dev, i), 0, dev->block_size);
+            rd_mark_dirty(dev, i);
             return (int)i;
         }
     }
@@ -209,6 +253,26 @@ static void rd_inode_free(rd_device_t dev, uint32_t idx) {
     if (!in) {
         return;
     }
+    /* Free double indirect blocks */
+    if (in->double_indirect) {
+        uint32_t* di_table = (uint32_t*)rd_block_ptr(dev, in->double_indirect);
+        size_t di_limit = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
+        for (size_t i = 0; i < di_limit; ++i) {
+            if (di_table[i]) {
+                uint32_t* table = (uint32_t*)rd_block_ptr(dev, di_table[i]);
+                size_t limit = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
+                for (size_t j = 0; j < limit; ++j) {
+                    if (table[j]) {
+                        rd_block_free(dev, table[j]);
+                    }
+                }
+                rd_block_free(dev, di_table[i]);
+            }
+        }
+        rd_block_free(dev, in->double_indirect);
+        in->double_indirect = 0;
+    }
+    /* Free indirect blocks */
     if (in->indirect) {
         uint32_t* table = (uint32_t*)rd_block_ptr(dev, in->indirect);
         size_t limit = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
@@ -220,6 +284,7 @@ static void rd_inode_free(rd_device_t dev, uint32_t idx) {
         rd_block_free(dev, in->indirect);
         in->indirect = 0;
     }
+    /* Free direct blocks */
     for (size_t i = 0; i < RD_MAX_DIRECT; ++i) {
         if (in->blocks[i]) {
             rd_block_free(dev, in->blocks[i]);
@@ -231,6 +296,9 @@ static void rd_inode_free(rd_device_t dev, uint32_t idx) {
 }
 
 static int rd_inode_get_block(rd_device_t dev, struct rd_inode* in, size_t logical_idx, int allocate) {
+    size_t per_block = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
+    
+    /* Direct blocks */
     if (logical_idx < RD_MAX_DIRECT) {
         if (in->blocks[logical_idx] == 0 && allocate) {
             int blk = rd_block_alloc(dev);
@@ -241,12 +309,46 @@ static int rd_inode_get_block(rd_device_t dev, struct rd_inode* in, size_t logic
         }
         return (int)in->blocks[logical_idx];
     }
+    
+    /* Single indirect blocks */
     size_t idx = logical_idx - RD_MAX_DIRECT;
-    size_t per_block = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
-    if (idx >= per_block) {
+    if (idx < per_block) {
+        if (in->indirect == 0) {
+            if (!allocate) {
+                return 0;
+            }
+            int blk = rd_block_alloc(dev);
+            if (blk < 0) {
+                return blk;
+            }
+            in->indirect = (uint32_t)blk;
+            rd_mark_dirty(dev, in->indirect);
+        }
+        uint32_t* table = (uint32_t*)rd_block_ptr(dev, in->indirect);
+        if (!table) {
+            return RD_ERR_IO;
+        }
+        if (table[idx] == 0 && allocate) {
+            int blk = rd_block_alloc(dev);
+            if (blk < 0) {
+                return blk;
+            }
+            table[idx] = (uint32_t)blk;
+            rd_mark_dirty(dev, in->indirect);
+        }
+        return (int)table[idx];
+    }
+    
+    /* Double indirect blocks */
+    idx -= per_block;
+    if (idx >= per_block * per_block) {
         return RD_ERR_RANGE;
     }
-    if (in->indirect == 0) {
+    
+    size_t di_idx = idx / per_block;
+    size_t si_idx = idx % per_block;
+    
+    if (in->double_indirect == 0) {
         if (!allocate) {
             return 0;
         }
@@ -254,20 +356,42 @@ static int rd_inode_get_block(rd_device_t dev, struct rd_inode* in, size_t logic
         if (blk < 0) {
             return blk;
         }
-        in->indirect = (uint32_t)blk;
+        in->double_indirect = (uint32_t)blk;
+        rd_mark_dirty(dev, in->double_indirect);
     }
-    uint32_t* table = (uint32_t*)rd_block_ptr(dev, in->indirect);
-    if (!table) {
+    
+    uint32_t* di_table = (uint32_t*)rd_block_ptr(dev, in->double_indirect);
+    if (!di_table) {
         return RD_ERR_IO;
     }
-    if (table[idx] == 0 && allocate) {
+    
+    if (di_table[di_idx] == 0) {
+        if (!allocate) {
+            return 0;
+        }
         int blk = rd_block_alloc(dev);
         if (blk < 0) {
             return blk;
         }
-        table[idx] = (uint32_t)blk;
+        di_table[di_idx] = (uint32_t)blk;
+        rd_mark_dirty(dev, in->double_indirect);
     }
-    return (int)table[idx];
+    
+    uint32_t* table = (uint32_t*)rd_block_ptr(dev, di_table[di_idx]);
+    if (!table) {
+        return RD_ERR_IO;
+    }
+    
+    if (table[si_idx] == 0 && allocate) {
+        int blk = rd_block_alloc(dev);
+        if (blk < 0) {
+            return blk;
+        }
+        table[si_idx] = (uint32_t)blk;
+        rd_mark_dirty(dev, di_table[di_idx]);
+    }
+    
+    return (int)table[si_idx];
 }
 
 static int rd_dir_add(rd_device_t dev, uint32_t dir_idx, uint32_t child_idx, const char* name, uint8_t ftype);
@@ -336,6 +460,12 @@ static int rd_format(rd_device_t dev) {
         return rc;
     }
     root->links = 2;
+    
+    /* Mark initial blocks as dirty */
+    for (uint32_t i = 0; i < data_start; ++i) {
+        rd_mark_dirty(dev, i);
+    }
+    
     return RD_OK;
 }
 
@@ -357,9 +487,20 @@ static int rd_is_dir_empty(rd_device_t dev, uint32_t dir_idx) {
     }
     size_t off = 0;
     while (off < dir->size) {
-        uint32_t blk_off = (uint32_t)(off / dev->block_size);
-        uint32_t blk_idx = dir->blocks[blk_off];
-        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(rd_block_ptr(dev, blk_idx) + (off % dev->block_size));
+        size_t blk_off = off / dev->block_size;
+        int blk = rd_inode_get_block(dev, dir, blk_off, 0);
+        if (blk <= 0) {
+            /* Shouldn't happen for valid directory, but be safe */
+            break;
+        }
+        unsigned char* blk_ptr = rd_block_ptr(dev, (uint32_t)blk);
+        if (!blk_ptr) {
+            break;
+        }
+        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(blk_ptr + (off % dev->block_size));
+        if (de->rec_len == 0) {
+            break; /* Malformed directory */
+        }
         if (de->inode != 0 && !(de->name_len == 1 && de->name[0] == '.') &&
             !(de->name_len == 2 && de->name[0] == '.' && de->name[1] == '.')) {
             return 0;
@@ -382,10 +523,20 @@ static int rd_dir_add(rd_device_t dev, uint32_t dir_idx, uint32_t child_idx, con
 
     size_t off = 0;
     while (off < dir->size) {
-        uint32_t blk_off = (uint32_t)(off / dev->block_size);
-        uint32_t blk_idx = dir->blocks[blk_off];
+        size_t blk_off = off / dev->block_size;
+        int blk = rd_inode_get_block(dev, dir, blk_off, 0);
+        if (blk <= 0) {
+            break; /* Can't find space in existing entries */
+        }
+        unsigned char* blk_ptr = rd_block_ptr(dev, (uint32_t)blk);
+        if (!blk_ptr) {
+            return RD_ERR_IO;
+        }
         size_t blk_inner = off % dev->block_size;
-        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(rd_block_ptr(dev, blk_idx) + blk_inner);
+        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(blk_ptr + blk_inner);
+        if (de->rec_len == 0) {
+            break; /* Malformed directory */
+        }
         uint16_t actual = (uint16_t)((sizeof(struct rd_dirent_disk) + de->name_len + 3u) & ~3u);
         if (de->rec_len >= actual + needed && de->inode != 0) {
             uint16_t remaining = de->rec_len - actual;
@@ -403,22 +554,32 @@ static int rd_dir_add(rd_device_t dev, uint32_t dir_idx, uint32_t child_idx, con
     }
 
     if (dir->size % dev->block_size == 0) {
+        size_t block_idx = dir->size / dev->block_size;
+        if (block_idx >= RD_MAX_DIRECT) {
+            return RD_ERR_NOSPC;
+        }
         int blk = rd_block_alloc(dev);
         if (blk < 0) {
             return blk;
         }
-        dir->blocks[dir->size / dev->block_size] = (uint32_t)blk;
+        dir->blocks[block_idx] = (uint32_t)blk;
         dir->size += dev->block_size;
-        dir->blocks[dir->size / dev->block_size - 1] = (uint32_t)blk;
     }
 
-    uint32_t blk_idx = dir->blocks[(dir->size - 1) / dev->block_size];
-    size_t blk_off = (dir->size - dev->block_size) % dev->block_size;
+    size_t logical_blk_idx = dir->size > 0 ? (dir->size - 1) / dev->block_size : 0;
+    int blk = rd_inode_get_block(dev, dir, logical_blk_idx, 0);
+    if (blk <= 0) {
+        return RD_ERR_IO;
+    }
+    size_t blk_off = dir->size > 0 ? (dir->size - dev->block_size) % dev->block_size : 0;
     if (dir->size == 0) {
-        blk_idx = dir->blocks[0];
         blk_off = 0;
     }
-    struct rd_dirent_disk* de = (struct rd_dirent_disk*)(rd_block_ptr(dev, blk_idx) + blk_off);
+    unsigned char* blk_ptr = rd_block_ptr(dev, (uint32_t)blk);
+    if (!blk_ptr) {
+        return RD_ERR_IO;
+    }
+    struct rd_dirent_disk* de = (struct rd_dirent_disk*)(blk_ptr + blk_off);
     de->inode = child_idx;
     de->rec_len = (uint16_t)(dev->block_size - blk_off);
     de->name_len = (uint8_t)name_len;
@@ -466,10 +627,17 @@ static int rd_dir_remove(rd_device_t dev, uint32_t dir_idx, const char* name, ui
     size_t off = 0;
     struct rd_dirent_disk* prev = NULL;
     while (off < dir->size) {
-        uint32_t blk_off = (uint32_t)(off / dev->block_size);
-        uint32_t blk_idx = dir->blocks[blk_off];
+        size_t blk_off = off / dev->block_size;
+        int blk = rd_inode_get_block(dev, dir, blk_off, 0);
+        if (blk <= 0) {
+            return RD_ERR_IO;
+        }
+        unsigned char* blk_ptr = rd_block_ptr(dev, (uint32_t)blk);
+        if (!blk_ptr) {
+            return RD_ERR_IO;
+        }
         size_t blk_inner = off % dev->block_size;
-        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(rd_block_ptr(dev, blk_idx) + blk_inner);
+        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(blk_ptr + blk_inner);
         if (de->inode != 0 && de->name_len == name_len && memcmp(de->name, name, name_len) == 0) {
             if (removed_inode) {
                 *removed_inode = de->inode;
@@ -636,6 +804,7 @@ static ssize_t rd_rw_core(rd_device_t dev, rd_fd fd, const void* in_buf, void* o
         }
         if (write_mode) {
             memcpy(blk_ptr + blk_off, (const unsigned char*)in_buf + copied, take);
+            rd_mark_dirty(dev, (uint32_t)blk);
         } else {
             memcpy((unsigned char*)out_buf + copied, blk_ptr + blk_off, take);
         }
@@ -659,6 +828,10 @@ RD_API rd_device_t rd_create(size_t size_bytes,
         errno = EINVAL;
         return NULL;
     }
+    if (size_bytes % block_size != 0) {
+        errno = EINVAL;
+        return NULL;
+    }
 
     rd_device_t dev = (rd_device_t)calloc(1, sizeof(*dev));
     if (!dev) {
@@ -667,6 +840,15 @@ RD_API rd_device_t rd_create(size_t size_bytes,
 
     dev->size_bytes = size_bytes;
     dev->block_size = block_size;
+    
+    /* Initialize dynamic handle table */
+    dev->handle_capacity = RD_MAX_HANDLES;
+    dev->handles = (struct rd_handle*)calloc(dev->handle_capacity, sizeof(struct rd_handle));
+    if (!dev->handles) {
+        free(dev);
+        errno = ENOMEM;
+        return NULL;
+    }
     if (backing_path) {
         size_t len = strlen(backing_path) + 1;
         dev->backing_path = (char*)malloc(len);
@@ -692,8 +874,18 @@ RD_API rd_device_t rd_create(size_t size_bytes,
         }
         long fsz = ftell(dev->backing_file);
         if (fsz < 0 || (size_t)fsz < size_bytes) {
-            if (fseek(dev->backing_file, (long)(size_bytes - 1), SEEK_SET) == 0) {
-                fputc('\0', dev->backing_file);
+            /* Ensure file is large enough */
+            if (fseek(dev->backing_file, 0, SEEK_SET) == 0) {
+                /* Write in chunks to avoid overflow with large files */
+                size_t remaining = size_bytes;
+                unsigned char zero_buf[4096] = {0};
+                while (remaining > 0) {
+                    size_t chunk = remaining > sizeof(zero_buf) ? sizeof(zero_buf) : remaining;
+                    if (fwrite(zero_buf, 1, chunk, dev->backing_file) != chunk) {
+                        break;
+                    }
+                    remaining -= chunk;
+                }
                 fflush(dev->backing_file);
             }
         }
@@ -706,11 +898,30 @@ RD_API rd_device_t rd_create(size_t size_bytes,
             fclose(dev->backing_file);
         }
         free(dev->backing_path);
+        free(dev->handles);
         free(dev);
         errno = ENOMEM;
         return NULL;
     }
     memset(dev->data, 0, size_bytes);
+    
+    /* Allocate dirty bitmap for incremental flushing */
+    if (dev->backing_file) {
+        size_t block_count = size_bytes / block_size;
+        size_t bitmap_bytes = (block_count + 7) / 8;
+        dev->dirty_bitmap = (unsigned char*)calloc(1, bitmap_bytes);
+        if (!dev->dirty_bitmap) {
+            rd_free_aligned(dev->data);
+            if (dev->backing_file) {
+                fclose(dev->backing_file);
+            }
+            free(dev->backing_path);
+            free(dev->handles);
+            free(dev);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
 
     if (dev->backing_file && !(flags & RD_BACKING_TRUNC)) {
         size_t read = fread(dev->data, 1, size_bytes, dev->backing_file);
@@ -752,6 +963,8 @@ RD_API void rd_destroy(rd_device_t dev) {
     }
     rd_free_aligned(dev->data);
     free(dev->backing_path);
+    free(dev->handles);
+    free(dev->dirty_bitmap);
     free(dev);
 }
 
@@ -784,6 +997,10 @@ RD_API ssize_t rd_block_write(rd_device_t dev,
         return RD_ERR_RANGE;
     }
     memcpy(dev->data + offset, buf, len);
+    /* Mark written blocks as dirty */
+    for (size_t i = 0; i < block_count; ++i) {
+        rd_mark_dirty(dev, (uint32_t)(block_idx + i));
+    }
     return (ssize_t)block_count;
 }
 
@@ -792,29 +1009,73 @@ RD_API int rd_block_flush(rd_device_t dev) {
         return RD_ERR_INVAL;
     }
     if (dev->backing_file) {
-        rewind(dev->backing_file);
-        size_t written = fwrite(dev->data, 1, dev->size_bytes, dev->backing_file);
-        fflush(dev->backing_file);
-        if (written < dev->size_bytes) {
-            return RD_ERR_IO;
+        struct rd_superblock* sb = rd_sb(dev);
+        if (dev->dirty_bitmap) {
+            /* Incremental flush: only write dirty blocks */
+            for (uint32_t i = 0; i < sb->block_count; ++i) {
+                if (rd_is_dirty(dev, i)) {
+                    size_t offset = (size_t)i * dev->block_size;
+                    if (fseek(dev->backing_file, (long)offset, SEEK_SET) != 0) {
+                        return RD_ERR_IO;
+                    }
+                    size_t written = fwrite(dev->data + offset, 1, dev->block_size, dev->backing_file);
+                    if (written < dev->block_size) {
+                        return RD_ERR_IO;
+                    }
+                    rd_clear_dirty(dev, i);
+                }
+            }
+        } else {
+            /* Full flush if no dirty tracking */
+            rewind(dev->backing_file);
+            size_t written = fwrite(dev->data, 1, dev->size_bytes, dev->backing_file);
+            if (written < dev->size_bytes) {
+                return RD_ERR_IO;
+            }
         }
+        fflush(dev->backing_file);
     }
     return RD_OK;
 }
 
 static int rd_handle_alloc(rd_device_t dev) {
-    for (int i = 0; i < RD_MAX_HANDLES; ++i) {
+    /* First, try to find an unused handle */
+    for (size_t i = 0; i < dev->handle_capacity; ++i) {
         if (!dev->handles[i].used) {
             dev->handles[i].used = 1;
             dev->handles[i].offset = 0;
-            return i;
+            return (int)i;
         }
     }
-    return RD_ERR_NOSPC;
+    
+    /* All handles in use, try to grow the table */
+    size_t new_capacity = dev->handle_capacity * 2;
+    if (new_capacity > 1024) {
+        /* Cap at 1024 handles to prevent excessive growth */
+        return RD_ERR_NOSPC;
+    }
+    
+    struct rd_handle* new_handles = (struct rd_handle*)realloc(
+        dev->handles, new_capacity * sizeof(struct rd_handle));
+    if (!new_handles) {
+        return RD_ERR_NOMEM;
+    }
+    
+    /* Initialize new handles */
+    memset(new_handles + dev->handle_capacity, 0, 
+           (new_capacity - dev->handle_capacity) * sizeof(struct rd_handle));
+    
+    dev->handles = new_handles;
+    size_t idx = dev->handle_capacity;
+    dev->handle_capacity = new_capacity;
+    
+    dev->handles[idx].used = 1;
+    dev->handles[idx].offset = 0;
+    return (int)idx;
 }
 
 static struct rd_handle* rd_handle_get(rd_device_t dev, rd_fd fd) {
-    if (fd < 0 || fd >= RD_MAX_HANDLES) {
+    if (fd < 0 || (size_t)fd >= dev->handle_capacity) {
         return NULL;
     }
     if (!dev->handles[fd].used) {
@@ -868,6 +1129,38 @@ RD_API rd_fd rd_open(rd_device_t dev, const char* path, unsigned flags, unsigned
         return RD_ERR_PERM;
     }
     if ((flags & RD_O_TRUNC) && in->type == RD_FT_FILE) {
+        /* Free double indirect blocks first */
+        if (in->double_indirect) {
+            uint32_t* di_table = (uint32_t*)rd_block_ptr(dev, in->double_indirect);
+            size_t di_limit = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
+            for (size_t i = 0; i < di_limit; ++i) {
+                if (di_table[i]) {
+                    uint32_t* table = (uint32_t*)rd_block_ptr(dev, di_table[i]);
+                    size_t limit = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
+                    for (size_t j = 0; j < limit; ++j) {
+                        if (table[j]) {
+                            rd_block_free(dev, table[j]);
+                        }
+                    }
+                    rd_block_free(dev, di_table[i]);
+                }
+            }
+            rd_block_free(dev, in->double_indirect);
+            in->double_indirect = 0;
+        }
+        /* Free indirect blocks */
+        if (in->indirect) {
+            uint32_t* table = (uint32_t*)rd_block_ptr(dev, in->indirect);
+            size_t limit = RD_MAX_INDIRECT_ENTRIES(dev->block_size);
+            for (size_t i = 0; i < limit; ++i) {
+                if (table[i]) {
+                    rd_block_free(dev, table[i]);
+                }
+            }
+            rd_block_free(dev, in->indirect);
+            in->indirect = 0;
+        }
+        /* Free direct blocks */
         for (size_t i = 0; i < RD_MAX_DIRECT; ++i) {
             if (in->blocks[i]) {
                 rd_block_free(dev, in->blocks[i]);
@@ -875,6 +1168,7 @@ RD_API rd_fd rd_open(rd_device_t dev, const char* path, unsigned flags, unsigned
             }
         }
         in->size = 0;
+        in->mtime = in->ctime = rd_now_ns();
     }
 
     int hidx = rd_handle_alloc(dev);
@@ -932,12 +1226,30 @@ RD_API ssize_t rd_pwrite(rd_device_t dev, rd_fd fd, const void* buf, size_t len,
 }
 
 RD_API int rd_seek(rd_device_t dev, rd_fd fd, long long off, int whence) {
-    (void)whence;
     struct rd_handle* h = rd_handle_get(dev, fd);
-    if (!h || off < 0) {
+    if (!h) {
         return RD_ERR_INVAL;
     }
-    h->offset = (size_t)off;
+    struct rd_inode* in = rd_inode_get(dev, h->inode_idx);
+    if (!in) {
+        return RD_ERR_INVAL;
+    }
+    
+    long long new_offset;
+    if (whence == 0 || whence == SEEK_SET) {
+        new_offset = off;
+    } else if (whence == 1 || whence == SEEK_CUR) {
+        new_offset = (long long)h->offset + off;
+    } else if (whence == 2 || whence == SEEK_END) {
+        new_offset = (long long)in->size + off;
+    } else {
+        return RD_ERR_INVAL;
+    }
+    
+    if (new_offset < 0) {
+        return RD_ERR_INVAL;
+    }
+    h->offset = (size_t)new_offset;
     return RD_OK;
 }
 
@@ -1057,6 +1369,7 @@ RD_API int rd_mkdir(rd_device_t dev, const char* path) {
         return blk;
     }
     dir->blocks[0] = (uint32_t)blk;
+    dir->size = 0;
     rc = rd_dir_add(dev, (uint32_t)new_inode, (uint32_t)new_inode, ".", RD_FT_DIR);
     if (rc != RD_OK) {
         rd_inode_free(dev, (uint32_t)new_inode);
@@ -1064,11 +1377,14 @@ RD_API int rd_mkdir(rd_device_t dev, const char* path) {
     }
     rc = rd_dir_add(dev, (uint32_t)new_inode, parent, "..", RD_FT_DIR);
     if (rc != RD_OK) {
+        /* Clean up the "." entry by clearing the directory */
+        dir->size = 0;
         rd_inode_free(dev, (uint32_t)new_inode);
         return rc;
     }
     rc = rd_dir_add(dev, parent, (uint32_t)new_inode, leaf, RD_FT_DIR);
     if (rc != RD_OK) {
+        /* Directory entries are cleaned by rd_inode_free */
         rd_inode_free(dev, (uint32_t)new_inode);
         return rc;
     }

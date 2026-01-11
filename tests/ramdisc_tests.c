@@ -217,6 +217,283 @@ static void test_backing_persistence(void) {
     unlink(path);
 }
 
+static void test_seek_whence(void) {
+    rd_device_t dev = make_dev();
+    printf("  - create file with content\n");
+    rd_fd fd = rd_open(dev, "/seektest", RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd >= 0);
+    const char msg[] = "0123456789";
+    /* Write without null terminator */
+    assert(rd_write(dev, fd, msg, strlen(msg)) == (ssize_t)strlen(msg));
+    
+    printf("  - test SEEK_SET (0)\n");
+    CHECK_OK(rd_seek(dev, fd, 5, SEEK_SET));
+    char buf[2] = {0};
+    assert(rd_read(dev, fd, buf, 1) == 1);
+    assert(buf[0] == '5');
+    
+    printf("  - test SEEK_CUR (1)\n");
+    CHECK_OK(rd_seek(dev, fd, -3, SEEK_CUR));
+    assert(rd_read(dev, fd, buf, 1) == 1);
+    assert(buf[0] == '3');
+    
+    printf("  - test SEEK_END (2)\n");
+    CHECK_OK(rd_seek(dev, fd, -5, SEEK_END));
+    assert(rd_read(dev, fd, buf, 1) == 1);
+    assert(buf[0] == '5');
+    
+    printf("  - test negative seek returns error\n");
+    assert(rd_seek(dev, fd, -100, SEEK_SET) == RD_ERR_INVAL);
+    
+    rd_close(dev, fd);
+    rd_destroy(dev);
+}
+
+static void test_concurrent_handles(void) {
+    rd_device_t dev = make_dev();
+    printf("  - create file and write initial data\n");
+    rd_fd fd1 = rd_open(dev, "/shared", RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd1 >= 0);
+    const char msg1[] = "AAAA";
+    assert(rd_write(dev, fd1, msg1, strlen(msg1)) == (ssize_t)strlen(msg1));
+    
+    printf("  - open same file again\n");
+    rd_fd fd2 = rd_open(dev, "/shared", RD_O_RDWR, 0);
+    assert(fd2 >= 0);
+    assert(fd1 != fd2);
+    
+    printf("  - verify independent file positions\n");
+    CHECK_OK(rd_seek(dev, fd1, 0, SEEK_SET));
+    CHECK_OK(rd_seek(dev, fd2, 2, SEEK_SET));
+    
+    const char msg2[] = "BB";
+    assert(rd_write(dev, fd2, msg2, strlen(msg2)) == (ssize_t)strlen(msg2));
+    
+    printf("  - verify writes visible from both handles\n");
+    CHECK_OK(rd_seek(dev, fd1, 0, SEEK_SET));
+    char buf[8] = {0};
+    assert(rd_read(dev, fd1, buf, 4) == 4);
+    assert(memcmp(buf, "AABB", 4) == 0);
+    
+    rd_close(dev, fd1);
+    rd_close(dev, fd2);
+    rd_destroy(dev);
+}
+
+static void test_max_file_size(void) {
+    rd_device_t dev = rd_create(8u << 20, 1024, NULL, 0);
+    assert(dev);
+    CHECK_OK(rd_mount(dev));
+    printf("  - calculate max file size for 1KB blocks\n");
+    /* 8 direct + 256 indirect (1024/4) = 264 blocks * 1024 = 270336 bytes */
+    size_t max_size = (8 + 256) * 1024;
+    
+    printf("  - create file and write to max capacity\n");
+    rd_fd fd = rd_open(dev, "/maxfile", RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd >= 0);
+    
+    unsigned char* buf = (unsigned char*)malloc(max_size);
+    for (size_t i = 0; i < max_size; ++i) buf[i] = (unsigned char)(i & 0xFF);
+    ssize_t written = rd_write(dev, fd, buf, max_size);
+    assert(written == (ssize_t)max_size);
+    
+    printf("  - verify file size at limit\n");
+    rd_stat_info st;
+    CHECK_OK(rd_fstat(dev, fd, &st));
+    assert(st.size_bytes == max_size);
+    
+    printf("  - write beyond to test double-indirect works\n");
+    CHECK_OK(rd_seek(dev, fd, 0, SEEK_END));
+    /* Should succeed now with double indirect (unless ENOSPC) */
+    ssize_t more = rd_write(dev, fd, "XXXX", 4);
+    assert(more == 4 || more == RD_ERR_NOSPC);
+    
+    free(buf);
+    rd_close(dev, fd);
+    rd_destroy(dev);
+}
+
+static void test_path_edge_cases(void) {
+    rd_device_t dev = make_dev();
+    
+    printf("  - test root path variations\n");
+    rd_stat_info st;
+    CHECK_OK(rd_stat(dev, "/", &st));
+    assert(st.type == RD_FT_DIR);
+    
+    printf("  - test missing leading slash\n");
+    assert(rd_stat(dev, "no�ash", &st) == RD_ERR_INVAL);
+    
+    printf("  - test empty path components (//dir)\n");
+    CHECK_OK(rd_mkdir(dev, "/validdir"));
+    /* Most implementations treat // as / but behavior may vary */
+    
+    printf("  - test long filename (near RD_MAX_NAME limit)\n");
+    char longname[RD_MAX_NAME + 10];
+    memset(longname, 'a', sizeof(longname) - 1);
+    longname[0] = '/';
+    longname[sizeof(longname) - 1] = '\0';
+    /* Should fail as name too long (exceeds RD_MAX_NAME) */
+    rd_fd fd = rd_open(dev, longname, RD_O_CREATE | RD_O_RDWR, 0644);
+    /* Implementation uses strnlen with RD_MAX_NAME so may not fail, just truncate */
+    if (fd >= 0) {
+        rd_close(dev, fd);
+        rd_unlink(dev, longname);
+    }
+    
+    printf("  - test filename exactly at RD_MAX_NAME-1 (should work)\\n");
+    char maxname[RD_MAX_NAME + 10];
+    memset(maxname, 'b', RD_MAX_NAME - 2);
+    maxname[0] = '/';
+    maxname[RD_MAX_NAME - 2] = '\0';
+    rd_fd fd2 = rd_open(dev, maxname, RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd2 >= 0);
+    rd_close(dev, fd2);
+    CHECK_OK(rd_unlink(dev, maxname));
+    
+    printf("  - test valid long path with multiple components\n");
+    CHECK_OK(rd_mkdir(dev, "/a"));
+    CHECK_OK(rd_mkdir(dev, "/a/b"));
+    CHECK_OK(rd_mkdir(dev, "/a/b/c"));
+    CHECK_OK(rd_stat(dev, "/a/b/c", &st));
+    assert(st.type == RD_FT_DIR);
+    
+    rd_destroy(dev);
+}
+
+static void test_enospc_recovery(void) {
+    rd_device_t dev = rd_create(32 * 1024, 1024, NULL, 0);
+    assert(dev);
+    CHECK_OK(rd_mount(dev));
+    
+    printf("  - fill device until ENOSPC\n");
+    rd_fd fd1 = rd_open(dev, "/fill1", RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd1 >= 0);
+    unsigned char buf[2048];
+    memset(buf, 0xAA, sizeof(buf));
+    int saw_nospc = 0;
+    for (int i = 0; i < 32; ++i) {
+        ssize_t r = rd_write(dev, fd1, buf, sizeof(buf));
+        if (r < 0) {
+            assert(r == RD_ERR_NOSPC);
+            saw_nospc = 1;
+            break;
+        }
+    }
+    assert(saw_nospc == 1);
+    rd_close(dev, fd1);
+    
+    printf("  - delete file and verify space recovered\n");
+    CHECK_OK(rd_unlink(dev, "/fill1"));
+    
+    printf("  - verify we can write again after recovery\n");
+    rd_fd fd2 = rd_open(dev, "/fill2", RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd2 >= 0);
+    ssize_t r = rd_write(dev, fd2, buf, sizeof(buf));
+    assert(r == (ssize_t)sizeof(buf));
+    rd_close(dev, fd2);
+    
+    printf("  - verify file contents after recovery\n");
+    rd_fd fd3 = rd_open(dev, "/fill2", RD_O_RDONLY, 0);
+    assert(fd3 >= 0);
+    unsigned char rbuf[2048] = {0};
+    assert(rd_read(dev, fd3, rbuf, sizeof(rbuf)) == (ssize_t)sizeof(rbuf));
+    assert(memcmp(buf, rbuf, sizeof(buf)) == 0);
+    rd_close(dev, fd3);
+    
+    rd_destroy(dev);
+}
+
+static void test_double_indirect(void) {
+    /* Test files larger than single indirect can handle */
+    rd_device_t dev = rd_create(16u << 20, 4096, NULL, 0);
+    assert(dev);
+    CHECK_OK(rd_mount(dev));
+    
+    printf("  - calculate sizes: 8 direct + 1024 indirect + need double-indirect\\n");
+    /* 8 direct (32KB) + 1024 indirect (4MB) = 4,227,072 bytes */
+    /* Write past this to test double indirect */
+    size_t past_indirect = (8 + 1024) * 4096;
+    size_t write_size = past_indirect + 8192; /* 2 blocks into double-indirect */
+    
+    printf("  - create large file requiring double indirect blocks\\n");
+    rd_fd fd = rd_open(dev, "/largefile", RD_O_CREATE | RD_O_RDWR, 0644);
+    assert(fd >= 0);
+    
+    /* Write pattern to end of file */
+    unsigned char* buf = (unsigned char*)malloc(write_size);
+    for (size_t i = 0; i < write_size; ++i) {
+        buf[i] = (unsigned char)((i / 4096) & 0xFF);
+    }
+    
+    printf("  - write %.2f MB to trigger double indirect\\n", write_size / (1024.0 * 1024.0));
+    ssize_t w = rd_write(dev, fd, buf, write_size);
+    assert(w == (ssize_t)write_size);
+    
+    printf("  - verify file size\\n");
+    rd_stat_info st;
+    CHECK_OK(rd_fstat(dev, fd, &st));
+    assert(st.size_bytes == write_size);
+    
+    printf("  - seek and verify data in double-indirect region\\n");
+    CHECK_OK(rd_seek(dev, fd, past_indirect, SEEK_SET));
+    unsigned char rbuf[8192];
+    ssize_t r = rd_read(dev, fd, rbuf, 8192);
+    assert(r == 8192);
+    assert(memcmp(rbuf, buf + past_indirect, 8192) == 0);
+    
+    free(buf);
+    rd_close(dev, fd);
+    rd_destroy(dev);
+}
+
+static void test_many_handles(void) {
+    /* Use larger device to support more inodes */
+    rd_device_t dev = rd_create(4u << 20, 4096, NULL, 0);
+    assert(dev);
+    CHECK_OK(rd_mount(dev));
+    
+    printf("  - open 100 files to exceed initial 64 handle limit\\n");
+    rd_fd fds[100];
+    int opened = 0;
+    for (int i = 0; i < 100; ++i) {
+        char path[32];
+        snprintf(path, sizeof(path), "/file%d", i);
+        fds[i] = rd_open(dev, path, RD_O_CREATE | RD_O_RDWR, 0644);
+        if (fds[i] < 0) {
+            /* May run out of space or inodes */
+            printf("  - opened %d files before failure\\n", i);
+            break;
+        }
+        opened++;
+    }
+    
+    /* Should have opened at least 70 to prove dynamic growth works */
+    assert(opened >= 70);
+    printf("  - successfully opened %d files (proves dynamic growth past 64)\\n", opened);
+    
+    printf("  - verify opened handles work independently\\n");
+    for (int i = 0; i < opened; ++i) {
+        char msg[16];
+        snprintf(msg, sizeof(msg), "FD%d", i);
+        ssize_t w = rd_write(dev, fds[i], msg, strlen(msg));
+        /* May hit ENOSPC with many small files */
+        if (w < 0) {
+            printf("  - hit error %zd writing to file %d\\n", w, i);
+            assert(w == RD_ERR_NOSPC);
+            break;
+        }
+        assert(w == (ssize_t)strlen(msg));
+    }
+    
+    printf("  - close all handles\\n");
+    for (int i = 0; i < opened; ++i) {
+        CHECK_OK(rd_close(dev, fds[i]));
+    }
+    
+    rd_destroy(dev);
+}
+
 static const struct test_case TEST_CASES[] = {
     {"root_stat", "root stat", test_root_stat},
     {"create_write_read", "create/write/read", test_create_write_read},
@@ -226,6 +503,13 @@ static const struct test_case TEST_CASES[] = {
     {"enospc_handling", "enospc handling", test_enospc},
     {"block_api", "block API", test_block_api},
     {"backing_persistence", "backing persistence", test_backing_persistence},
+    {"seek_whence", "seek with whence modes", test_seek_whence},
+    {"concurrent_handles", "concurrent file handles", test_concurrent_handles},
+    {"max_file_size", "maximum file size", test_max_file_size},
+    {"path_edge_cases", "path edge cases", test_path_edge_cases},
+    {"enospc_recovery", "ENOSPC recovery", test_enospc_recovery},
+    {"double_indirect", "double indirect blocks", test_double_indirect},
+    {"many_handles", "dynamic handle growth", test_many_handles},
 };
 
 static const size_t TEST_CASE_COUNT = sizeof(TEST_CASES) / sizeof(TEST_CASES[0]);

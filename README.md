@@ -80,15 +80,110 @@ int main() {
 - On `rd_unmount` or `rd_block_flush`, the entire in-memory image is written to the backing file if configured.
 
 ## Error model
-Functions return `RD_OK` (0) or negative `rd_err` codes: `RD_ERR_NOENT`, `RD_ERR_EXIST`, `RD_ERR_NOSPC`, `RD_ERR_INVAL`, `RD_ERR_PERM`, `RD_ERR_RANGE`, `RD_ERR_NOMEM`, `RD_ERR_IO`, `RD_ERR_NOSYS`.
+Functions return `RD_OK` (0) or negative `rd_err` codes:
+- `RD_ERR_IO` (-1): I/O error (backing file, corrupted internal structures)
+- `RD_ERR_NOENT` (-2): File/directory not found
+- `RD_ERR_EXIST` (-3): File/directory already exists (with O_EXCL)
+- `RD_ERR_NOSPC` (-4): No space left (blocks or inodes exhausted)
+- `RD_ERR_INVAL` (-5): Invalid argument (null pointer, bad path, invalid whence)
+- `RD_ERR_PERM` (-6): Operation not permitted (unlink directory, write to directory, rmdir non-empty)
+- `RD_ERR_RANGE` (-7): Out of range (block index, file size beyond indirect limit)
+- `RD_ERR_NOMEM` (-8): Memory allocation failed
+- `RD_ERR_NOSYS` (-9): Not implemented (reserved for future features)
+
+### Function-specific error codes
+- **rd_create**: Returns NULL and sets `errno` on failure (EINVAL, ENOMEM)
+- **rd_open**: Returns RD_ERR_NOENT (not found), RD_ERR_EXIST (O_EXCL), RD_ERR_NOSPC (no handles/inodes), RD_ERR_PERM (write to directory)
+- **rd_read/write**: Returns RD_ERR_INVAL (bad fd/type), RD_ERR_NOSPC (allocation failure), bytes transferred on success
+- **rd_seek**: Returns RD_ERR_INVAL (bad fd/whence, negative result); whence: 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END
+- **rd_stat**: Returns RD_ERR_NOENT (not found), RD_ERR_INVAL (bad args)
+- **rd_mkdir**: Returns RD_ERR_EXIST (already exists), RD_ERR_NOSPC (no inodes/blocks)
+- **rd_rmdir**: Returns RD_ERR_PERM (non-empty or not directory), RD_ERR_NOENT (not found)
+- **rd_unlink**: Returns RD_ERR_PERM (is directory or root), RD_ERR_NOENT (not found)
+
+## API contracts and behavior
+
+### File descriptors
+- File descriptors are integers in range [0, 64)
+- Each `rd_open` allocates a new handle; same file can be opened multiple times
+- Each handle maintains independent position offset
+- Closing an fd makes it available for reuse
+- Using a closed fd returns RD_ERR_INVAL
+- Destroying device invalidates all fds (no automatic cleanup)
+
+### File operations
+- **Reads** beyond EOF return 0 (not an error); partial reads to EOF return actual bytes
+- **Writes** extend file automatically; may fail with RD_ERR_NOSPC or RD_ERR_RANGE (beyond indirect limit)
+- **Sparse files**: Unallocated blocks read as zeros; blocks allocated on write
+- **O_APPEND**: Seeks to end before each write (position set at open and per write)
+- **O_TRUNC**: Immediately frees all blocks and resets size to 0; updates mtime/ctime
+- **pread/pwrite**: Do not modify file position
+- **Concurrent access**: Multiple handles to same file see each other's writes immediately (no buffering)
+
+### Directory operations
+- Directories initially contain \".\" (self) and \"..\" (parent) with link count 2
+- Root directory's \"..\" points to itself
+- `rd_readdir` calls callback for each entry including \".\" and \"..\"; callback can return non-zero to stop iteration
+- Empty directory check ignores \".\" and \"..\"; `rd_rmdir` fails on non-empty with RD_ERR_PERM
+- Directory link count = 2 + number of subdirectories
+
+### Memory and lifecycle
+- `rd_create` allocates aligned memory for entire device; fails if allocation fails
+- `rd_mount` formats if no valid superblock; validates existing superblock
+- `rd_unmount` flushes to backing file (if present); does not free memory
+- `rd_destroy` frees all memory and closes backing file; does not flush (call rd_unmount first)
+- **Thread safety**: Not thread-safe; caller must serialize access
+
+### Limits
+- Max open file descriptors: 64 initially, grows dynamically up to 1024 per device
+- Max filename length: 63 bytes + null terminator (RD_MAX_NAME = 64)
+- Max path length: 255 bytes (temp buffer in rd_lookup)
+- Max file size with 4KB blocks: ~4GB (8 direct + 1024 single-indirect + 1024×1024 double-indirect blocks)
+  - Direct: 8 × 4KB = 32KB
+  - Single indirect: 1024 × 4KB = 4MB
+  - Double indirect: 1024 × 1024 × 4KB = 4GB
+- Max directory entries per block: varies by name length
+- Block size: Must be power of 2
+- Device size: Must be multiple of block_size
+
+## Performance characteristics
+
+### Time complexity
+- **Block allocation**: O(n) where n = block_count; linear search from data_start
+- **Inode allocation**: O(n) where n = inode_count; linear search
+- **Path lookup**: O(d × m) where d = path depth, m = entries per directory (linear search)
+- **Directory add/remove**: O(m) where m = entries in directory
+- **File read/write**: O(k) where k = blocks accessed; block lookup is O(1) direct, O(1) indirect
+- **rd_readdir**: O(m) where m = entries in directory
+
+### Space overhead
+- **Superblock**: 1 block (stores metadata)
+- **Block bitmap**: ⌈block_count / 8 / block_size⌉ blocks
+- **Inode table**: ⌈inode_count × 64 / block_size⌉ blocks (64 bytes per inode)
+- **Directory entries**: ~16-80 bytes per entry (depends on name length, 4-byte aligned)
+- **Example**: 1MB device, 4KB blocks → 256 blocks, 64 inodes, ~5% overhead (superblock + 1 bitmap + 1 inode block)
+
+### Memory usage
+- Entire device held in RAM (size_bytes allocated with rd_create)
+- No page cache or buffer cache (direct memory access)
+- Backing file (if used) uses incremental writes via dirty block tracking
+  - Only modified blocks flushed on rd_block_flush/rd_unmount
+  - Dirty bitmap overhead: ⌈block_count / 8⌉ bytes
+  - Example: 1GB device with 4KB blocks = 256K blocks = 32KB dirty bitmap
 
 ## Current limitations
 - No permissions enforcement beyond simple mode checks; no users/groups.
-- No journaling or crash recovery; backing flush is whole-image, not incremental.
-- No double-indirect blocks; large files are limited to single-indirect capacity.
+- No journaling or crash recovery; backing flush is incremental (dirty blocks only) but not atomic.
 - No hard links or symlinks; no rename; no fsync per file (only full flush via `rd_block_flush`).
 - Single-device, in-process only; not mounted into the OS VFS.
 - Concurrency is not thread-safe yet (callers must serialize).
+- Handle table grows dynamically but caps at 1024 open files per device.
+
+## Recent improvements (v0.2)
+- **Double indirect blocks**: Files can now grow up to ~4GB (with 4KB blocks) instead of ~4MB
+- **Incremental backing flush**: Only dirty blocks written to backing file, dramatically faster for large devices
+- **Dynamic file handles**: Handle table grows from 64 to 1024 as needed, no hard limit on concurrent opens
+- **Dirty tracking**: Backing file writes are now O(d) where d = dirty blocks, not O(n) where n = total blocks
 
 ## Testing
 - Build and run: `ctest --test-dir build --output-on-failure`.

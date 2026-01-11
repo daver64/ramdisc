@@ -125,6 +125,13 @@ if(RD_BUILD_TESTS)
         enospc_handling
         block_api
         backing_persistence
+        seek_whence
+        concurrent_handles
+        max_file_size
+        path_edge_cases
+        enospc_recovery
+        double_indirect
+        many_handles
     )
     foreach(tc IN LISTS RAMDISC_TEST_CASES)
         add_test(NAME ramdisc.${tc} COMMAND ramdisc_tests --case ${tc})
