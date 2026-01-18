@@ -15,11 +15,13 @@ Options (CMake cache):
 - `RD_BUILD_STATIC` (OFF): also build static lib.
 - `RD_ENABLE_JOURNAL` (OFF): reserved; no-op.
 - `RD_BUILD_TESTS` (ON): build test executable.
+- `RD_BUILD_FUSE` (OFF): build FUSE filesystem adapter.
 
 Outputs:
 - Library target: `ramdisc` (alias `ramdisc::ramdisc`).
 - Header: `include/ramdisc.h`.
 - Tests: `build/ramdisc_tests`.
+- FUSE adapter: `build/ramdisc_fuse` (if `RD_BUILD_FUSE=ON`).
 
 ## Usage (C API)
 
@@ -208,3 +210,196 @@ Functions return `RD_OK` (0) or negative `rd_err` codes:
 - Build and run: `ctest --test-dir build --output-on-failure`.
 - Coverage includes: mount/format, create/read/write/seek, directory listing, unlink/rmdir rules, indirect-block I/O, ENOSPC behavior, block API sanity, backing persistence across remounts, rename operations, per-file fsync, thread safety.
 - 18 tests total, all passing.
+
+## FUSE Filesystem Adapter
+
+The FUSE adapter allows you to mount your ramdisc as a real directory in your filesystem, making it accessible to any application using standard POSIX file operations.
+
+### Building with FUSE
+
+First, install FUSE development libraries:
+```bash
+# Debian/Ubuntu
+sudo apt-get install libfuse-dev
+
+# Fedora/RHEL
+sudo dnf install fuse-devel
+
+# macOS (using FUSE for macOS)
+brew install macfuse
+```
+
+Build with FUSE support:
+```bash
+cmake -S . -B build -DRD_BUILD_FUSE=ON
+cmake --build build
+```
+
+### Using the FUSE Adapter
+
+#### Quick Start
+
+Mount a 64 MB ramdisc (runs in background):
+```bash
+mkdir /tmp/myram
+./build/ramdisc_fuse /tmp/myram
+```
+
+Use it like any directory:
+```bash
+echo "Hello from FUSE!" > /tmp/myram/test.txt
+cat /tmp/myram/test.txt
+mkdir /tmp/myram/subdir
+cp /etc/hosts /tmp/myram/
+ls -la /tmp/myram/
+```
+
+Unmount when done:
+```bash
+fusermount -u /tmp/myram
+```
+
+#### Advanced Usage
+
+Mount with custom size (256 MB):
+```bash
+./build/ramdisc_fuse -o size=256 /tmp/myram
+```
+
+Mount with backing file for persistence:
+```bash
+# First mount - creates and uses backing file
+./build/ramdisc_fuse -o backing=/tmp/ramdisc.img /tmp/myram
+echo "persistent data" > /tmp/myram/file.txt
+fusermount -u /tmp/myram
+
+# Later mount - data persists!
+./build/ramdisc_fuse -o backing=/tmp/ramdisc.img /tmp/myram
+cat /tmp/myram/file.txt  # Shows "persistent data"
+```
+
+Run in foreground (useful for debugging):
+```bash
+./build/ramdisc_fuse -f /tmp/myram
+# Press Ctrl+C to unmount
+```
+
+Enable debug output:
+```bash
+./build/ramdisc_fuse -d -f /tmp/myram
+```
+
+#### Real-World Examples
+
+**Use as fast tmpfs replacement:**
+```bash
+./build/ramdisc_fuse -o size=512 /tmp/fast
+cd /tmp/fast
+# Compile projects, extract archives, etc.
+```
+
+**Run SQLite database in RAM:**
+```bash
+./build/ramdisc_fuse -o size=128 /tmp/db
+sqlite3 /tmp/db/test.db "CREATE TABLE users (id INT, name TEXT);"
+sqlite3 /tmp/db/test.db "INSERT INTO users VALUES (1, 'Alice');"
+```
+
+**Development workspace with persistence:**
+```bash
+./build/ramdisc_fuse -o size=1024,backing=$HOME/.ramdisc.img /tmp/workspace
+# Your files persist across reboots via backing file
+```
+
+**Check filesystem status:**
+```bash
+df -h /tmp/myram          # Show capacity and usage
+mount | grep ramdisc_fuse # Verify mount
+tree /tmp/myram           # View directory structure
+```
+
+### FUSE Options
+
+- `-o size=MB` - Set ramdisc size in megabytes (default: 64)
+- `-o backing=PATH` - Use a backing file for persistence
+- `-f` - Run in foreground (blocks terminal, Ctrl+C to unmount)
+- `-d` - Enable FUSE debug output (implies `-f`)
+- `-s` - Single-threaded mode (useful for debugging)
+- `-o allow_other` - Allow other users to access (requires user_allow_other in /etc/fuse.conf)
+
+### Supported Operations
+
+All standard POSIX file operations work:
+- **Files**: create, read, write, truncate, delete
+- **Directories**: create, list, delete (when empty)
+- **Operations**: rename, stat, fsync
+- **Access modes**: read-only, write-only, read-write
+- **Seek modes**: SEEK_SET, SEEK_CUR, SEEK_END
+
+Example workflow:
+```bash
+# Create and edit files with any tool
+vim /tmp/myram/notes.txt
+echo "data" > /tmp/myram/file.txt
+
+# Standard utilities work
+cp -r /etc/ssl/certs /tmp/myram/
+tar xzf archive.tar.gz -C /tmp/myram/
+find /tmp/myram -name "*.txt"
+
+# Applications see it as a normal filesystem
+sqlite3 /tmp/myram/database.db
+gcc -o /tmp/myram/program source.c
+```
+
+### Troubleshooting
+
+**Mount fails with "mountpoint is not empty":**
+```bash
+# Clean the directory first
+rm -rf /tmp/myram/*
+# Or use the nonempty option (not recommended)
+./build/ramdisc_fuse -o nonempty /tmp/myram
+```
+
+**Check if mounted:**
+```bash
+mount | grep ramdisc_fuse
+df -h /tmp/myram
+```
+
+**Unmount stuck filesystem:**
+```bash
+# Lazy unmount
+fusermount -uz /tmp/myram
+
+# Force unmount (if lazy doesn't work)
+sudo umount -l /tmp/myram
+```
+
+**Permission denied errors:**
+```bash
+# Ensure you have permission to the mount point
+ls -ld /tmp/myram
+
+# For multi-user access, add allow_other option
+./build/ramdisc_fuse -o allow_other /tmp/myram
+```
+
+### Benefits of FUSE Integration
+
+- **Zero code changes**: Existing applications work without modification
+- **Standard tools**: Use `ls`, `cp`, `mv`, `cat`, etc.
+- **Editor support**: Any text editor can open files directly
+- **Database support**: Run SQLite or other databases on ramdisc
+- **Mount anywhere**: Integrate seamlessly into your filesystem hierarchy
+- **Fast tmpfs alternative**: With ext2-like structure and optional persistence
+
+### Limitations
+
+- Same as C API: max file size ~4GB (with 4KB blocks and double indirect)
+- 64-character filename limit
+- No symbolic links or hard links yet
+- No extended attributes
+- FUSE adds some overhead vs. direct C API usage
+

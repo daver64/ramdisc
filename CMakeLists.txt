@@ -5,6 +5,7 @@ option(RD_BUILD_SHARED "Build ramdisc as a shared library" ON)
 option(RD_BUILD_STATIC "Build ramdisc as a static library" OFF)
 option(RD_ENABLE_JOURNAL "Enable journaling stubs" OFF)
 option(RD_BUILD_TESTS "Build unit tests" ON)
+option(RD_BUILD_FUSE "Build FUSE filesystem adapter" OFF)
 
 set(RAMDISC_SOURCES
     src/ramdisc.c
@@ -142,4 +143,28 @@ if(RD_BUILD_TESTS)
         add_test(NAME ramdisc.${tc} COMMAND ramdisc_tests --case ${tc})
     endforeach()
     add_test(NAME ramdisc.all COMMAND ramdisc_tests)
+endif()
+
+if(RD_BUILD_FUSE)
+    # Find FUSE library
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FUSE REQUIRED fuse)
+    
+    add_executable(ramdisc_fuse fuse/ramdisc_fuse.c)
+    target_link_libraries(ramdisc_fuse PRIVATE ramdisc ${FUSE_LIBRARIES})
+    target_include_directories(ramdisc_fuse PRIVATE 
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FUSE_INCLUDE_DIRS}
+    )
+    target_compile_options(ramdisc_fuse PRIVATE ${FUSE_CFLAGS_OTHER})
+    
+    if(MSVC)
+        target_compile_options(ramdisc_fuse PRIVATE /W4)
+    else()
+        target_compile_options(ramdisc_fuse PRIVATE -Wall -Wextra)
+    endif()
+    
+    install(TARGETS ramdisc_fuse
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
 endif()
