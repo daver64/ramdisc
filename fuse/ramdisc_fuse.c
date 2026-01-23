@@ -235,6 +235,16 @@ static int ramdisc_rename(const char *from, const char *to) {
 }
 
 static int ramdisc_truncate(const char *path, off_t size) {
+    /* For truncate to zero, use O_TRUNC which properly frees blocks */
+    if (size == 0) {
+        rd_fd fd = rd_open(g_device, path, RD_O_RDWR | RD_O_TRUNC, 0644);
+        if (fd < 0) {
+            return rd_to_errno(fd);
+        }
+        rd_close(g_device, fd);
+        return 0;
+    }
+    
     /* Open file for writing */
     rd_fd fd = rd_open(g_device, path, RD_O_RDWR, 0644);
     if (fd < 0) {
@@ -264,7 +274,7 @@ static int ramdisc_truncate(const char *path, off_t size) {
             return rd_to_errno((int)written);
         }
     }
-    /* Note: Shrinking files not yet supported - would need to free blocks */
+    /* Note: Shrinking files to non-zero size not yet supported */
     
     rd_close(g_device, fd);
     return 0;
@@ -274,6 +284,13 @@ static int ramdisc_ftruncate(const char *path, off_t size, struct fuse_file_info
     (void)path;
     
     rd_fd fd = (rd_fd)fi->fh;
+    
+    /* For truncate to zero, we need to close and reopen with O_TRUNC */
+    if (size == 0) {
+        /* Note: This is not ideal but rd_open with O_TRUNC properly frees blocks */
+        /* A better approach would be adding rd_ftruncate to the API */
+        return ramdisc_truncate(path, size);
+    }
     
     /* Get current size */
     rd_stat_info st;
@@ -295,7 +312,7 @@ static int ramdisc_ftruncate(const char *path, off_t size, struct fuse_file_info
             return rd_to_errno((int)written);
         }
     }
-    /* Note: Shrinking files not yet supported */
+    /* Note: Shrinking files to non-zero size not yet supported */
     
     return 0;
 }

@@ -235,14 +235,20 @@ static int rd_block_alloc(rd_device_t dev) {
     }
     uint32_t next_free = block_data[0];
     
-    /* Update free list head */
+    /* Mark as allocated and clear - do this before updating free list */
+    rd_bitmap_set(dev, block_idx, 1);
+    unsigned char* blk_ptr = rd_block_ptr(dev, block_idx);
+    if (!blk_ptr) {
+        /* Restore free list head on failure */
+        rd_bitmap_set(dev, block_idx, 0);
+        return RD_ERR_IO;
+    }
+    memset(blk_ptr, 0, dev->block_size);
+    rd_mark_dirty(dev, block_idx);
+    
+    /* Update free list head only after successful allocation */
     sb->free_block_head = next_free;
     sb->free_blocks--;
-    
-    /* Mark as allocated and clear */
-    rd_bitmap_set(dev, block_idx, 1);
-    memset(rd_block_ptr(dev, block_idx), 0, dev->block_size);
-    rd_mark_dirty(dev, block_idx);
     
     return (int)block_idx;
 }
@@ -1013,6 +1019,20 @@ RD_API rd_device_t rd_create(size_t size_bytes,
     /* Allocate dirty bitmap for incremental flushing */
     if (dev->backing_file) {
         size_t block_count = size_bytes / block_size;
+        /* Check for overflow */
+        if (block_count > SIZE_MAX / 8) {
+            rd_free_aligned(dev->data);
+            if (dev->backing_file) {
+                fclose(dev->backing_file);
+            }
+            free(dev->backing_path);
+            free(dev->handles);
+            pthread_mutex_destroy(&dev->handle_lock);
+            pthread_rwlock_destroy(&dev->fs_lock);
+            free(dev);
+            errno = ENOMEM;
+            return NULL;
+        }
         size_t bitmap_bytes = (block_count + 7) / 8;
         dev->dirty_bitmap = (unsigned char*)calloc(1, bitmap_bytes);
         if (!dev->dirty_bitmap) {

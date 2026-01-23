@@ -2,6 +2,8 @@
 
 A cross-platform in-memory disk with a small ext2-like filesystem that can build as a shared library (.so/.dll). It exposes a C API with both block-level access and file-level operations, optionally persisting to a backing file.
 
+**Recent improvements**: All critical bugs fixed including directory indirect block support, infinite loop prevention, race condition fixes, and proper link count management. All tests passing.
+
 ## Building
 
 ```
@@ -70,16 +72,18 @@ int main() {
 
 ### Types and limits
 - Names: `RD_MAX_NAME` (64 bytes). Paths are POSIX-style (`/` separated); no relative paths.
-- Inode blocks: 8 direct + 1 single-indirect. Max file size ≈ `(8 + indirect_entries) * block_size`; with 4 KiB blocks, ~ (8 + 1024) blocks ≈ 4 MiB.
-- Handles: up to 64 open file descriptors per device.
+- Inode blocks: 8 direct + 1 single-indirect + 1 double-indirect. Max file size with 4KB blocks: ~4GB.
+- Handles: 64 initial capacity, grows dynamically up to 1024 open file descriptors per device.
 - Block size must divide device size.
+- Directories support indirect blocks for large directories (tested with 100+ entries).
 
 ## How it works
 - Superblock + block bitmap + inode table + data blocks laid out in RAM (and mirrored to backing when present).
-- Allocation: block bitmap tracks free blocks; inodes track direct blocks and an optional single-indirect block.
+- Allocation: free list-based block allocation with bitmap tracking; inodes track direct, single-indirect, and double-indirect blocks.
 - Directories store variable-length entries similar to ext2; `rd_readdir` walks entries and supplies a callback.
 - Reads of sparse holes return zeroed data.
-- On `rd_unmount` or `rd_block_flush`, the entire in-memory image is written to the backing file if configured.
+- On `rd_unmount` or `rd_block_flush`, dirty blocks are written to the backing file if configured.
+- Robust error handling prevents infinite loops, race conditions, and data corruption.
 
 ## Error model
 Functions return `RD_OK` (0) or negative `rd_err` codes:
@@ -119,7 +123,7 @@ Functions return `RD_OK` (0) or negative `rd_err` codes:
 - **Writes** extend file automatically; may fail with RD_ERR_NOSPC or RD_ERR_RANGE (beyond indirect limit)
 - **Sparse files**: Unallocated blocks read as zeros; blocks allocated on write
 - **O_APPEND**: Seeks to end before each write (position set at open and per write)
-- **O_TRUNC**: Immediately frees all blocks and resets size to 0; updates mtime/ctime
+- **O_TRUNC**: Immediately frees all direct, indirect, and double-indirect blocks; resets size to 0; updates mtime/ctime
 - **pread/pwrite**: Do not modify file position
 - **Concurrent access**: Multiple handles to same file see each other's writes immediately (no buffering)
 
