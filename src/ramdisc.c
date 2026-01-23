@@ -230,6 +230,9 @@ static int rd_block_alloc(rd_device_t dev) {
     
     /* Read next pointer from free block */
     uint32_t* block_data = (uint32_t*)rd_block_ptr(dev, block_idx);
+    if (!block_data) {
+        return RD_ERR_IO;
+    }
     uint32_t next_free = block_data[0];
     
     /* Update free list head */
@@ -255,6 +258,9 @@ static void rd_block_free(rd_device_t dev, uint32_t block_idx) {
         
         /* Add to head of free list */
         uint32_t* block_data = (uint32_t*)rd_block_ptr(dev, block_idx);
+        if (!block_data) {
+            return;
+        }
         block_data[0] = sb->free_block_head;
         sb->free_block_head = block_idx;
         rd_mark_dirty(dev, block_idx);
@@ -525,11 +531,7 @@ static int rd_format(rd_device_t dev) {
     root->links = 1;
     root->ctime = root->mtime = root->atime = rd_now_ns();
 
-    int blk = rd_block_alloc(dev);
-    if (blk < 0) {
-        return blk;
-    }
-    root->blocks[0] = (uint32_t)blk;
+    /* Don't pre-allocate block - rd_dir_add will do it */
     root->size = 0;
     int rc = rd_dir_add(dev, sb->root_inode, sb->root_inode, ".", RD_FT_DIR);
     if (rc != RD_OK) {
@@ -633,27 +635,23 @@ static int rd_dir_add(rd_device_t dev, uint32_t dir_idx, uint32_t child_idx, con
         off += de->rec_len;
     }
 
-    if (dir->size % dev->block_size == 0) {
+    /* Need to extend the directory to a new block? */
+    size_t entry_offset = dir->size % dev->block_size;
+    if (entry_offset == 0) {
         size_t block_idx = dir->size / dev->block_size;
-        if (block_idx >= RD_MAX_DIRECT) {
-            return RD_ERR_NOSPC;
-        }
-        int blk = rd_block_alloc(dev);
+        int blk = rd_inode_get_block(dev, dir, block_idx, 1);
         if (blk < 0) {
             return blk;
         }
-        dir->blocks[block_idx] = (uint32_t)blk;
         dir->size += dev->block_size;
     }
 
-    size_t logical_blk_idx = dir->size > 0 ? (dir->size - 1) / dev->block_size : 0;
+    /* Get the block and offset for the new entry */
+    size_t blk_off = entry_offset;
+    size_t logical_blk_idx = (dir->size - dev->block_size + entry_offset) / dev->block_size;
     int blk = rd_inode_get_block(dev, dir, logical_blk_idx, 0);
     if (blk <= 0) {
         return RD_ERR_IO;
-    }
-    size_t blk_off = dir->size > 0 ? (dir->size - dev->block_size) % dev->block_size : 0;
-    if (dir->size == 0) {
-        blk_off = 0;
     }
     unsigned char* blk_ptr = rd_block_ptr(dev, (uint32_t)blk);
     if (!blk_ptr) {
@@ -666,6 +664,7 @@ static int rd_dir_add(rd_device_t dev, uint32_t dir_idx, uint32_t child_idx, con
     de->file_type = ftype;
     memcpy(de->name, name, name_len);
     dir->mtime = dir->ctime = rd_now_ns();
+    rd_mark_dirty(dev, (uint32_t)blk);
     return RD_OK;
 }
 
@@ -680,10 +679,16 @@ static int rd_dir_find(rd_device_t dev, uint32_t dir_idx, const char* name, uint
     }
     size_t off = 0;
     while (off < dir->size) {
-        uint32_t blk_off = (uint32_t)(off / dev->block_size);
-        uint32_t blk_idx = dir->blocks[blk_off];
+        size_t blk_off = off / dev->block_size;
+        int blk_idx = rd_inode_get_block(dev, dir, blk_off, 0);
+        if (blk_idx <= 0) {
+            break;
+        }
         size_t blk_inner = off % dev->block_size;
-        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(rd_block_ptr(dev, blk_idx) + blk_inner);
+        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(rd_block_ptr(dev, (uint32_t)blk_idx) + blk_inner);
+        if (de->rec_len == 0) {
+            break; /* Malformed or empty directory block */
+        }
         if (de->inode != 0 && de->name_len == name_len && memcmp(de->name, name, name_len) == 0) {
             if (out_inode) {
                 *out_inode = de->inode;
@@ -718,6 +723,9 @@ static int rd_dir_remove(rd_device_t dev, uint32_t dir_idx, const char* name, ui
         }
         size_t blk_inner = off % dev->block_size;
         struct rd_dirent_disk* de = (struct rd_dirent_disk*)(blk_ptr + blk_inner);
+        if (de->rec_len == 0) {
+            break; /* Malformed directory */
+        }
         if (de->inode != 0 && de->name_len == name_len && memcmp(de->name, name, name_len) == 0) {
             if (removed_inode) {
                 *removed_inode = de->inode;
@@ -1032,7 +1040,7 @@ RD_API rd_device_t rd_create(size_t size_bytes,
 }
 
 RD_API int rd_mount(rd_device_t dev) {
-    if (!dev) {
+    if (!dev || !dev->data) {
         return RD_ERR_INVAL;
     }
     pthread_rwlock_wrlock(&dev->fs_lock);
@@ -1048,7 +1056,7 @@ RD_API int rd_mount(rd_device_t dev) {
 }
 
 RD_API int rd_unmount(rd_device_t dev) {
-    if (!dev) {
+    if (!dev || !dev->data) {
         return RD_ERR_INVAL;
     }
     pthread_rwlock_wrlock(&dev->fs_lock);
@@ -1160,7 +1168,7 @@ static int rd_handle_alloc(rd_device_t dev) {
         if (!dev->handles[i].used) {
             dev->handles[i].used = 1;
             dev->handles[i].offset = 0;
-            pthread_mutex_unlock(&dev->handle_lock);
+            /* Note: Caller must unlock handle_lock after initializing the handle */
             return (int)i;
         }
     }
@@ -1176,6 +1184,7 @@ static int rd_handle_alloc(rd_device_t dev) {
     struct rd_handle* new_handles = (struct rd_handle*)realloc(
         dev->handles, new_capacity * sizeof(struct rd_handle));
     if (!new_handles) {
+        /* Note: original dev->handles is still valid on realloc failure */
         pthread_mutex_unlock(&dev->handle_lock);
         return RD_ERR_NOMEM;
     }
@@ -1190,7 +1199,7 @@ static int rd_handle_alloc(rd_device_t dev) {
     
     dev->handles[idx].used = 1;
     dev->handles[idx].offset = 0;
-    pthread_mutex_unlock(&dev->handle_lock);
+    /* Note: Caller must unlock handle_lock after initializing the handle */
     return (int)idx;
 }
 
@@ -1312,12 +1321,14 @@ RD_API rd_fd rd_open(rd_device_t dev, const char* path, unsigned flags, unsigned
 
     int hidx = rd_handle_alloc(dev);
     if (hidx < 0) {
+        /* rd_handle_alloc releases handle_lock on error */
         pthread_rwlock_unlock(&dev->fs_lock);
         return hidx;
     }
     dev->handles[hidx].inode_idx = inode;
     dev->handles[hidx].flags = flags;
     dev->handles[hidx].offset = (flags & RD_O_APPEND) ? in->size : 0;
+    pthread_mutex_unlock(&dev->handle_lock);
     pthread_rwlock_unlock(&dev->fs_lock);
     return hidx;
 }
@@ -1591,6 +1602,11 @@ RD_API int rd_mkdir(rd_device_t dev, const char* path) {
         pthread_rwlock_unlock(&dev->fs_lock);
         return rc;
     }
+    /* Increment parent link count (for the .. entry) */
+    struct rd_inode* parent_in = rd_inode_get(dev, parent);
+    if (parent_in) {
+        parent_in->links++;
+    }
     pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
 }
@@ -1631,6 +1647,11 @@ RD_API int rd_rmdir(rd_device_t dev, const char* path) {
         pthread_rwlock_unlock(&dev->fs_lock);
         return RD_ERR_IO;
     }
+    /* Decrement parent link count (for the .. entry) */
+    struct rd_inode* parent_in = rd_inode_get(dev, parent);
+    if (parent_in && parent_in->links > 0) {
+        parent_in->links--;
+    }
     rd_inode_free(dev, inode);
     pthread_rwlock_unlock(&dev->fs_lock);
     return RD_OK;
@@ -1654,10 +1675,16 @@ RD_API int rd_readdir(rd_device_t dev, const char* path, rd_dirent_cb cb, void* 
     }
     size_t off = 0;
     while (off < dir->size) {
-        uint32_t blk_off = (uint32_t)(off / dev->block_size);
-        uint32_t blk_idx = dir->blocks[blk_off];
+        size_t blk_off = off / dev->block_size;
+        int blk_idx = rd_inode_get_block(dev, dir, blk_off, 0);
+        if (blk_idx <= 0) {
+            break;
+        }
         size_t blk_inner = off % dev->block_size;
-        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(rd_block_ptr(dev, blk_idx) + blk_inner);
+        struct rd_dirent_disk* de = (struct rd_dirent_disk*)(rd_block_ptr(dev, (uint32_t)blk_idx) + blk_inner);
+        if (de->rec_len == 0) {
+            break; /* Malformed directory */
+        }
         if (de->inode != 0) {
             rd_stat_info st;
             struct rd_inode* in = rd_inode_get(dev, de->inode);

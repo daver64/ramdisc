@@ -235,15 +235,23 @@ static int ramdisc_rename(const char *from, const char *to) {
 }
 
 static int ramdisc_truncate(const char *path, off_t size) {
-    /* Open, truncate via seeking and writing, then close */
-    rd_fd fd = rd_open(g_device, path, RD_O_RDWR | RD_O_TRUNC, 0644);
+    /* Open file for writing */
+    rd_fd fd = rd_open(g_device, path, RD_O_RDWR, 0644);
     if (fd < 0) {
         return rd_to_errno(fd);
     }
     
-    /* If truncating to non-zero size, seek and write a byte */
-    if (size > 0) {
-        int ret = rd_seek(g_device, fd, size - 1, 0);
+    /* Get current size */
+    rd_stat_info st;
+    int ret = rd_fstat(g_device, fd, &st);
+    if (ret < 0) {
+        rd_close(g_device, fd);
+        return rd_to_errno(ret);
+    }
+    
+    /* If growing file, seek to new size - 1 and write a byte */
+    if ((off_t)st.size_bytes < size) {
+        ret = rd_seek(g_device, fd, size - 1, 0);
         if (ret < 0) {
             rd_close(g_device, fd);
             return rd_to_errno(ret);
@@ -256,6 +264,7 @@ static int ramdisc_truncate(const char *path, off_t size) {
             return rd_to_errno((int)written);
         }
     }
+    /* Note: Shrinking files not yet supported - would need to free blocks */
     
     rd_close(g_device, fd);
     return 0;
@@ -266,9 +275,16 @@ static int ramdisc_ftruncate(const char *path, off_t size, struct fuse_file_info
     
     rd_fd fd = (rd_fd)fi->fh;
     
-    /* Seek to desired size - 1 and write a byte */
-    if (size > 0) {
-        int ret = rd_seek(g_device, fd, size - 1, 0);
+    /* Get current size */
+    rd_stat_info st;
+    int ret = rd_fstat(g_device, fd, &st);
+    if (ret < 0) {
+        return rd_to_errno(ret);
+    }
+    
+    /* Only handle growing files - seek to desired size - 1 and write a byte */
+    if ((off_t)st.size_bytes < size) {
+        ret = rd_seek(g_device, fd, size - 1, 0);
         if (ret < 0) {
             return rd_to_errno(ret);
         }
@@ -279,6 +295,7 @@ static int ramdisc_ftruncate(const char *path, off_t size, struct fuse_file_info
             return rd_to_errno((int)written);
         }
     }
+    /* Note: Shrinking files not yet supported */
     
     return 0;
 }
